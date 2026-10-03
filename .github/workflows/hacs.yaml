@@ -12,3 +12,6 @@ jobs:
         with:
           category: integration
           comment: "false"
+          # Default-catalog submission requires a license; custom installs do not.
+          # Preserve the owner\'s licensing choice instead of assigning one.
+          ignore: license

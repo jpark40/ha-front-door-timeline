@@ -1,0 +1,6 @@
+# Add this top-level block to /config/configuration.yaml.
+# The integration creates the directory automatically at startup.
+front_door_timeline:
+  directory: /media/front_door_snapshots
+  retention_days: 30
+

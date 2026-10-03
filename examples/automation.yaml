@@ -1,0 +1,19 @@
+alias: Front Door - Save snapshots to timeline
+description: Save the Eufy front-door event image when it updates.
+triggers:
+  # Omitting from/to also catches image entity attribute updates.
+  - trigger: state
+    entity_id: image.front_door_event_image
+    id: image_update
+conditions:
+  - condition: template
+    value_template: >-
+      {{ trigger.to_state is not none and
+         trigger.to_state.state not in ['unknown', 'unavailable', 'none', ''] }}
+actions:
+  - action: front_door_timeline.capture
+    data:
+      entity_id: image.front_door_event_image
+      label: image_update
+mode: queued
+max: 10

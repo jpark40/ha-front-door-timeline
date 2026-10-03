@@ -1,0 +1,17 @@
+{
+  "domain": "front_door_timeline",
+  "name": "Front Door Snapshot Timeline",
+  "version": "1.0.5",
+  "documentation": "https://github.com/jpark40/ha-front-door-timeline",
+  "codeowners": [
+    "@jpark40"
+  ],
+  "requirements": [],
+  "iot_class": "local_push",
+  "issue_tracker": "https://github.com/jpark40/ha-front-door-timeline/issues",
+  "dependencies": [
+    "http",
+    "camera",
+    "image"
+  ]
+}

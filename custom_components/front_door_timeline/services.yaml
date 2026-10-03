@@ -1,0 +1,27 @@
+capture:
+  name: Capture timeline snapshot
+  description: Save a timestamped camera or image entity snapshot to the private timeline directory.
+  fields:
+    entity_id:
+      name: Camera or image entity
+      description: The camera or image entity to save.
+      required: true
+      selector:
+        entity:
+          multiple: false
+          filter:
+            - domain:
+                - camera
+                - image
+    label:
+      name: Event label
+      description: Short label shown below the image, such as motion, person, or doorbell.
+      required: false
+      default: motion
+      selector:
+        text:
+
+cleanup:
+  name: Clean up old snapshots
+  description: Delete timeline snapshots older than the configured retention period.
+

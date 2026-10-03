@@ -1,0 +1,23 @@
+name: Publish release
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: release
+  cancel-in-progress: false
+jobs:
+  release:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify package
+        run: |
+          python3 scripts/validate.py
+      - name: Publish current version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          release_version="$(cat VERSION)"
+          gh release create "v$release_version" --target "$GITHUB_SHA" --generate-notes --title "v$release_version"

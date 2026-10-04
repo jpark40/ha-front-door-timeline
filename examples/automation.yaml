@@ -1,19 +1,30 @@
 alias: Front Door - Save snapshots to timeline
-description: Save the Eufy front-door event image when it updates.
+description: Save each new Eufy SDK event image with its detection category.
 triggers:
-  # Omitting from/to also catches image entity attribute updates.
   - trigger: state
-    entity_id: image.front_door_event_image
+    entity_id: image.front_door_last_event
     id: image_update
 conditions:
   - condition: template
     value_template: >-
-      {{ trigger.to_state is not none and
+      {{ trigger.from_state is not none and trigger.to_state is not none and
+         trigger.from_state.state not in ['unknown', 'unavailable', 'none', ''] and
+         trigger.from_state.state != trigger.to_state.state and
          trigger.to_state.state not in ['unknown', 'unavailable', 'none', ''] }}
+variables:
+  # Freeze the label before the queued capture runs. Old detections must not
+  # categorize a manual refresh or an unrelated thumbnail.
+  event_label: >-
+        {% set detection = states('event.front_door_detection') %}
+        {% set kind = state_attr('event.front_door_detection', 'event_type') %}
+        {% set age = as_timestamp(trigger.to_state.state, 0) - as_timestamp(detection, 0) %}
+        {{ kind if kind in ['person', 'stranger', 'package_delivered',
+                            'package_taken', 'package_stranded', 'motion']
+                   and 0 <= age <= 60 else 'image_update' }}
 actions:
   - action: front_door_timeline.capture
     data:
-      entity_id: image.front_door_event_image
-      label: image_update
+      entity_id: image.front_door_last_event
+      label: "{{ event_label }}"
 mode: queued
 max: 10

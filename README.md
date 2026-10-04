@@ -2,7 +2,7 @@
 
 ![Repository icon](icon.png)
 
-Version 1.0.5 is a HACS packaging release. Backend Python logic is unchanged from the recovered working package. Manifest metadata now identifies this repository and its version.
+Version 1.0.6 updates the optional capture automation for Eufy SDK. Backend Python logic is unchanged from the recovered working package. Manifest metadata now identifies this repository and its version.
 
 ## Install or migrate
 
@@ -24,7 +24,7 @@ This repository contains one integration, as required by HACS. It is intended to
 
 ## Front-door capture automation
 
-The updated optional automation example watches `image.front_door_event_image` and captures that image entity. Replace your prior capture automation only if needed; do not install both. YAML examples are not automatically applied by HACS. Backend service logic is unchanged.
+The updated optional automation example watches `image.front_door_last_event` and captures that image entity. Replace your prior capture automation only if needed; do not install both. YAML examples are not automatically applied by HACS. Backend service logic is unchanged. The example stores current detection types from `event.front_door_detection` as labels for the Person and Package dashboard tabs. Replace the actions/triggers in your existing automation, keeping its ID. Do not add a duplicate. Unknown or stale detection metadata uses `image_update` and appears under All. Capture is triggered by a new image timestamp; a detection alone does not mean a new thumbnail is available.
 
 ## Icons
 

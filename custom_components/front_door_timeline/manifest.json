@@ -1,7 +1,7 @@
 {
   "domain": "front_door_timeline",
   "name": "Front Door Snapshot Timeline",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "documentation": "https://github.com/jpark40/ha-front-door-timeline",
   "codeowners": [
     "@jpark40"

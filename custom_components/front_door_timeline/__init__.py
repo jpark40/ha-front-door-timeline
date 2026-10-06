@@ -115,6 +115,13 @@ def _build_index(directory: Path, requested_date: str | None) -> dict[str, Any]:
 
     all_items.sort(key=lambda item: (item["timestamp"], item["file"]))
     counts = Counter(item["date"] for item in all_items)
+    category_counts = Counter()
+    for item in all_items:
+        label = item["label"].lower().replace("_", " ").replace("-", " ")
+        if re.match(r"^(person|stranger)( |$)", label):
+            category_counts["person"] += 1
+        elif re.match(r"^package( |$)", label):
+            category_counts["package"] += 1
     dates = [{"date": date, "count": counts[date]} for date in sorted(counts)]
 
     selected_date = requested_date
@@ -132,6 +139,10 @@ def _build_index(directory: Path, requested_date: str | None) -> dict[str, Any]:
         "selected_date": selected_date,
         "latest_date": dates[-1]["date"] if dates else None,
         "total_count": len(all_items),
+        "counts": {
+            "person": category_counts["person"],
+            "package": category_counts["package"],
+        },
         "dates": dates,
         "images": images,
     }

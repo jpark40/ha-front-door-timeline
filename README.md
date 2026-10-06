@@ -2,7 +2,7 @@
 
 ![Repository icon](icon.png)
 
-Version 1.0.6 updates the optional capture automation for Eufy SDK. Backend Python logic is unchanged from the recovered working package. Manifest metadata now identifies this repository and its version.
+Version 1.0.7 adds all-history Person and Package counts to the timeline index API for the matching dashboard tab badges. The optional Eufy SDK capture automation continues to label snapshots from `event.front_door_detection`.
 
 ## Install or migrate
 

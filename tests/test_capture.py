@@ -22,6 +22,7 @@ def load_component():
     class HomeAssistantError(Exception):
         pass
 
+    module("aiohttp", web=SimpleNamespace())
     module("voluptuous", Schema=lambda value, **kw: value,
            Required=lambda value, **kw: value, Optional=lambda value, **kw: value,
            All=lambda *args: args, Coerce=lambda value: value,

@@ -2,7 +2,7 @@
 
 ![Repository icon](icon.png)
 
-Version 1.0.7 adds all-history Person and Package counts to the timeline index API for the matching dashboard tab badges. The optional Eufy SDK capture automation continues to label snapshots from `event.front_door_detection`.
+Version 1.0.8 prevents an unchanged thumbnail from being saved repeatedly under new timestamps. The optional Eufy SDK capture automation continues to label snapshots from `event.front_door_detection`.
 
 ## Install or migrate
 
@@ -24,10 +24,33 @@ This repository contains one integration, as required by HACS. It is intended to
 
 ## Front-door capture automation
 
-The updated optional automation example watches `image.front_door_last_event` and captures that image entity. Replace your prior capture automation only if needed; do not install both. YAML examples are not automatically applied by HACS. Backend service logic is unchanged. The example stores current detection types from `event.front_door_detection` as labels for the Person and Package dashboard tabs. Replace the actions/triggers in your existing automation, keeping its ID. Do not add a duplicate. Unknown or stale detection metadata uses `image_update` and appears in neither the Person nor Package tab. Capture is triggered by a new image timestamp; a detection alone does not mean a new thumbnail is available.
+The optional automation example watches `image.front_door_last_event` and captures that image entity. Replace your prior capture automation only if needed; do not install both. YAML examples are not automatically applied by HACS. The example stores current detection types from `event.front_door_detection` as labels for the Person and Package dashboard tabs. Replace the actions/triggers in your existing automation, keeping its ID. Do not add a duplicate. Unknown or stale detection metadata uses `image_update` and appears in neither the Person nor Package tab. Capture is triggered by a new image timestamp; a detection alone does not mean a new thumbnail is available.
+
+### Repeated thumbnails
+
+An image entity can receive a new timestamp while still returning the previous
+picture. Queued captures can also read the same latest thumbnail. The backend
+now compares SHA-256 hashes of the image bytes against the latest saved snapshot
+with the same label. If unchanged, the capture completes successfully without
+adding a file or increasing the counts. This check uses saved history, so it also
+works after an HA restart. Different event labels are kept separately to preserve
+package and person events; a different image is always saved.
+
+Captures are serialized and written under a temporary filename before an atomic
+commit, so the API never indexes a partial snapshot. Existing snapshots are not
+deleted or relabeled by the update. Install **v1.0.8** in HACS and restart Home
+Assistant; the existing automation can stay as it is.
+
+To inspect skipped captures, temporarily enable info logging for
+`custom_components.front_door_timeline`. A skipped capture reports
+`Skipped duplicate snapshot ... image bytes are unchanged from ...`. This means
+the image source supplied the same data; deduplication cannot make Eufy deliver
+a fresh frame. Byte-identical repeats are suppressed; this is not a visual or
+perceptual comparison, so recompressed images can still be distinct.
 
 ## Icons
 
 The repository contains a custom icon in 256px and 512px PNG, with editable SVG source. For integrations, `brand/icon.png` and `brand/icon@2x.png` are bundled inside the integration; Home Assistant 2026.3+ can display these local brand images.
 
 HACS currently uses its external brands source for integration list icons; the open upstream issue https://github.com/hacs/integration/issues/5223 prevents local-only brand assets from reliably appearing there. Dashboard repositories use HACS's generic Dashboard category icon rather than a per-repository custom icon. The artwork is visible in each repository README and is included for supported HA surfaces. No unsupported icon field is added to hacs.json.
+

@@ -19,9 +19,11 @@ jobs:
       - name: Verify package
         run: |
           python3 scripts/validate.py
+          python3 -m unittest discover -s tests -v
       - name: Publish current version
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           release_version="$(cat VERSION)"
           gh release create "v$release_version" --target "$GITHUB_SHA" --generate-notes --title "v$release_version"
+

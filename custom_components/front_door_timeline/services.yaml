@@ -1,6 +1,6 @@
 capture:
   name: Capture timeline snapshot
-  description: Save a timestamped camera or image entity snapshot to the private timeline directory.
+  description: Save a timestamped snapshot unless its image bytes and label match the previous capture. Unchanged images are skipped successfully.
   fields:
     entity_id:
       name: Camera or image entity
@@ -24,4 +24,5 @@ capture:
 cleanup:
   name: Clean up old snapshots
   description: Delete timeline snapshots older than the configured retention period.
+
 

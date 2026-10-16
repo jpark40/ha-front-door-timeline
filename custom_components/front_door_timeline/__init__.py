@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections import Counter
 from datetime import datetime
 import logging
@@ -9,6 +10,7 @@ from pathlib import Path
 import re
 from typing import Any
 from urllib.parse import quote
+from uuid import uuid4
 
 from aiohttp import web
 import voluptuous as vol
@@ -31,19 +33,11 @@ from .const import (
     SERVICE_CAPTURE,
     SERVICE_CLEANUP,
 )
+from .snapshot import SNAPSHOT_RE, finalize_snapshot
 
 _LOGGER = logging.getLogger(__name__)
 
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-SNAPSHOT_RE = re.compile(
-    r"^front_door_"
-    r"(?P<date>\d{4}-\d{2}-\d{2})_"
-    r"(?P<hour>\d{2})-(?P<minute>\d{2})-(?P<second>\d{2})"
-    r"(?:-(?P<fraction>\d{1,6}))?"
-    r"(?:_(?P<label>[A-Za-z0-9_-]+))?"
-    r"\.(?P<extension>jpe?g|png)$",
-    re.IGNORECASE,
-)
 
 CONFIG_SCHEMA = vol.Schema(
     {
@@ -224,6 +218,7 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
     retention_days = component_config[CONF_RETENTION_DAYS]
 
     await hass.async_add_executor_job(directory.mkdir, 0o755, True, True)
+    capture_lock = asyncio.Lock()
 
     hass.data[DOMAIN] = {
         CONF_DIRECTORY: directory,
@@ -249,32 +244,44 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
                 "front_door_timeline.capture requires a camera or image entity"
             )
 
-        now = datetime.now().astimezone()
-        label = _safe_label(call.data[ATTR_LABEL])
-        filename = (
-            f"front_door_{now:%Y-%m-%d_%H-%M-%S}-{now.microsecond:06d}_{label}.jpg"
-        )
-        destination = directory / filename
-
-        await hass.services.async_call(
-            entity_domain,
-            "snapshot",
-            {"filename": str(destination)},
-            blocking=True,
-            context=call.context,
-            target={ATTR_ENTITY_ID: entity_id},
-        )
-
-        def _valid_snapshot() -> bool:
-            try:
-                return destination.is_file() and destination.stat().st_size > 0
-            except OSError:
-                return False
-
-        if not await hass.async_add_executor_job(_valid_snapshot):
-            raise HomeAssistantError(
-                f"Snapshot action completed but no image was written to {destination}"
+        # Separate automations may call this service concurrently. Serialize the
+        # complete capture/compare/commit operation so neither can save a copy.
+        async with capture_lock:
+            now = datetime.now().astimezone()
+            label = _safe_label(call.data[ATTR_LABEL])
+            filename = (
+                f"front_door_{now:%Y-%m-%d_%H-%M-%S}-{now.microsecond:06d}_{label}.jpg"
             )
+            destination = directory / filename
+            pending = directory / f".front_door_pending_{uuid4().hex}.jpg"
+
+            try:
+                await hass.services.async_call(
+                    entity_domain,
+                    "snapshot",
+                    {"filename": str(pending)},
+                    blocking=True,
+                    context=call.context,
+                    target={ATTR_ENTITY_ID: entity_id},
+                )
+                try:
+                    kept = await hass.async_add_executor_job(
+                        finalize_snapshot, pending, destination
+                    )
+                except (OSError, ValueError) as err:
+                    raise HomeAssistantError(str(err)) from err
+            finally:
+                # Also discard partial data if the upstream service raises.
+                await hass.async_add_executor_job(pending.unlink, True)
+
+            if kept != destination:
+                _LOGGER.info(
+                    "Skipped duplicate snapshot from %s (%s); image bytes are "
+                    "unchanged from %s",
+                    entity_id, label, kept.name,
+                )
+            else:
+                _LOGGER.debug("Saved snapshot from %s to %s", entity_id, filename)
 
     async def handle_cleanup(call: ServiceCall) -> None:
         await _async_cleanup()
@@ -293,3 +300,4 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
 
     await _async_cleanup()
     return True
+

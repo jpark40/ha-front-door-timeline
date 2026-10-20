@@ -2,7 +2,7 @@
 
 ![Repository icon](icon.png)
 
-Version 1.0.9 handles delayed Eufy SDK event images, exposes source freshness to the card, and adds a supported source-refresh action. Version 1.0.8's unchanged-image protection is retained.
+Version 1.0.10 fixes Refresh source: it now saves the available image directly to the timeline, waits for a background image update, and reports clearly when no newer or classifiable image is available. Earlier delayed-image handling and duplicate protection are retained.
 
 ## Install or migrate
 
@@ -59,10 +59,25 @@ data:
   entity_id: image.front_door_last_event
 ```
 
-The matching button is resolved by its registry unique ID, so a renamed button
-still works. Eufy can complete the refresh in the background and then update the
-image entity; the existing image automation captures it. This action does not
-start a live stream. It cannot force a HomeBase to return a cover it has not
+In **v1.0.10**, the action resolves the matching button by registry unique ID,
+requests a refresh, and archives the currently available classified image itself.
+It does not depend on the image automation firing a new state-change trigger.
+The saved filename uses the **source image timestamp**, so syncing an old cover
+does not make it look like a new event. Identical content is still suppressed.
+After the button returns, the action waits up to 20 seconds for a background
+image update if the existing image is already archived or unavailable. A saved
+image response contains its filename, label, and source timestamp. If nothing
+new arrives, the action raises a clear error containing the source timestamp and
+the existing filename instead of returning a silent success.
+
+If no Person/Package detection can be matched to the source image, the action
+adds no hidden `image_update` entry and reports the classification problem. After
+visually checking the source image, you can explicitly provide `label: person`
+or `label: package` to sync that verified category.
+
+Install backend **v1.0.10**, keep dashboard **v1.0.9 or later**, restart HA, and run
+the action again. Regular automatic capture still uses the existing automation.
+This action does not start a live stream. It cannot force a HomeBase to return a cover it has not
 provided. The bridge's [current HomeBase 3 report](https://github.com/mega-yfue/ha-eufy-sdk-bridge/issues/134)
 and [troubleshooting guide](https://github.com/mega-yfue/ha-eufy-sdk-bridge/blob/main/docs/troubleshooting.md)
 describe cached thumbnails, missing local covers, and push/DNS failures. If the

@@ -64,6 +64,8 @@ def finalize_snapshot(pending: Path, destination: Path) -> Path:
         if match is None:
             raise ValueError("Invalid timeline snapshot filename")
         if destination.exists():
+            if _digest(pending) == _digest(destination):
+                return destination
             raise FileExistsError(destination)
 
         label = (match.group("label") or "event").lower()

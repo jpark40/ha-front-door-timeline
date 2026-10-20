@@ -17,7 +17,7 @@ import voluptuous as vol
 
 from homeassistant.components.http import HomeAssistantView
 from homeassistant.const import ATTR_ENTITY_ID
-from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import entity_registry as er
@@ -40,6 +40,7 @@ from .event_label import delayed_image_label, detection_entity_for
 _LOGGER = logging.getLogger(__name__)
 
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+REFRESH_SYNC_TIMEOUT_SECONDS = 20
 
 CONFIG_SCHEMA = vol.Schema(
     {
@@ -250,8 +251,10 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
             _LOGGER.info("Removed %s expired front-door snapshot(s)", removed)
         return removed
 
-    async def handle_capture(call: ServiceCall) -> None:
-        entity_id = call.data[ATTR_ENTITY_ID]
+    async def _async_capture(
+        entity_id: str, requested_label: str, context: Any,
+        image_time: datetime | None = None,
+    ) -> dict[str, Any]:
         entity_domain = entity_id.split(".", 1)[0]
         if entity_domain not in {"camera", "image"}:
             raise HomeAssistantError(
@@ -263,8 +266,8 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
         # Separate automations may call this service concurrently. Serialize the
         # complete capture/compare/commit operation so neither can save a copy.
         async with capture_lock:
-            now = datetime.now().astimezone()
-            label = _safe_label(call.data[ATTR_LABEL])
+            now = image_time.astimezone() if image_time else datetime.now().astimezone()
+            label = _safe_label(requested_label)
             # Older installed automations use image_update after 60 s. The current
             # bridge may deliver a valid HomeBase cover up to four minutes later.
             # Recover only a bounded, known classification; leave explicit labels
@@ -285,6 +288,7 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
                 f"front_door_{now:%Y-%m-%d_%H-%M-%S}-{now.microsecond:06d}_{label}.jpg"
             )
             destination = directory / filename
+            already_existed = await hass.async_add_executor_job(destination.is_file)
             pending = directory / f".front_door_pending_{uuid4().hex}.jpg"
 
             try:
@@ -293,7 +297,7 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
                     "snapshot",
                     {"filename": str(pending)},
                     blocking=True,
-                    context=call.context,
+                    context=context,
                     target={ATTR_ENTITY_ID: entity_id},
                 )
                 try:
@@ -314,12 +318,21 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
                 )
             else:
                 _LOGGER.debug("Saved snapshot from %s to %s", entity_id, filename)
+            return {
+                "status": "saved" if kept == destination and not already_existed else "unchanged",
+                "file": kept.name,
+                "label": label,
+                "image_timestamp": image_time.isoformat() if image_time else None,
+            }
+
+    async def handle_capture(call: ServiceCall) -> None:
+        await _async_capture(call.data[ATTR_ENTITY_ID], call.data[ATTR_LABEL], call.context)
 
     async def handle_cleanup(call: ServiceCall) -> None:
         await _async_cleanup()
 
-    async def handle_refresh_source(call: ServiceCall) -> None:
-        """Use the SDK's supported refresh control without guessing a button ID."""
+    async def handle_refresh_source(call: ServiceCall) -> dict[str, Any]:
+        """Request a refresh AND archive the image; do not depend on an automation edge."""
         source_id = call.data[ATTR_ENTITY_ID]
         registry = er.async_get(hass)
         source = registry.async_get(source_id)
@@ -333,6 +346,56 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
             "button", "press", {}, blocking=True, context=call.context,
             target={ATTR_ENTITY_ID: button_id},
         )
+        explicit_label = call.data.get(ATTR_LABEL)
+        if explicit_label and not re.match(r"^(person|stranger|package)(_|-|$)", _safe_label(explicit_label)):
+            raise HomeAssistantError("Choose a person or package label for the visible timeline tabs")
+        states = hass.states
+        detection_id = detection_entity_for(source_id)
+        deadline = asyncio.get_running_loop().time() + REFRESH_SYNC_TIMEOUT_SECONDS
+        last_state = None
+        result = None
+        classification_missing = False
+        while True:
+            image = states.get(source_id)
+            source_state = image.state if image is not None else None
+            try:
+                image_time = datetime.fromisoformat(source_state.replace("Z", "+00:00"))
+                if image_time.tzinfo is None:
+                    image_time = None
+            except (ValueError, TypeError, AttributeError):
+                image_time = None
+            if image_time is not None and source_state != last_state:
+                last_state = source_state
+                detection = states.get(detection_id) if detection_id else None
+                label = _safe_label(explicit_label) if explicit_label else (
+                    delayed_image_label(source_state, detection.state,
+                                        detection.attributes.get("event_type"))
+                    if detection is not None else None
+                )
+                classification_missing = label is None
+                if label:
+                    result = await _async_capture(source_id, label, call.context, image_time)
+                    if result["status"] == "saved":
+                        return result
+            if asyncio.get_running_loop().time() >= deadline:
+                break
+            await asyncio.sleep(0.5)
+        if classification_missing:
+            raise HomeAssistantError(
+                f"Eufy image timestamp is {last_state}, but no matching person/package detection "
+                "metadata is available. Specify label: person or label: package only if you "
+                "have verified what the image shows. No unclassified timeline entry was added."
+            )
+        if result is not None:
+            raise HomeAssistantError(
+                f"Eufy supplied no newer image during the refresh wait (source timestamp: {last_state}). "
+                f"The timeline already contains the same image in {result['file']}. "
+                "A successful bridge request does not mean a fresh cover was delivered."
+            )
+        raise HomeAssistantError(
+            f"No usable Eufy Last event image arrived (state: {last_state or source_state}). "
+            "Check the Eufy SDK Bridge event-image/cover log."
+        )
 
     hass.services.async_register(
         DOMAIN, SERVICE_CAPTURE, handle_capture, schema=CAPTURE_SCHEMA
@@ -340,7 +403,9 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
     hass.services.async_register(DOMAIN, SERVICE_CLEANUP, handle_cleanup)
     hass.services.async_register(
         DOMAIN, "refresh_source", handle_refresh_source,
-        schema=vol.Schema({vol.Required(ATTR_ENTITY_ID): cv.entity_id}),
+        schema=vol.Schema({vol.Required(ATTR_ENTITY_ID): cv.entity_id,
+                           vol.Optional(ATTR_LABEL): cv.string}),
+        supports_response=SupportsResponse.OPTIONAL,
     )
 
     async def schedule_cleanup(_now: datetime) -> None:

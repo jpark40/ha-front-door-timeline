@@ -31,7 +31,8 @@ def load_component():
     module("homeassistant.components")
     module("homeassistant.components.http", HomeAssistantView=object)
     module("homeassistant.const", ATTR_ENTITY_ID="entity_id")
-    module("homeassistant.core", HomeAssistant=object, ServiceCall=object)
+    module("homeassistant.core", HomeAssistant=object, ServiceCall=object,
+           SupportsResponse=SimpleNamespace(OPTIONAL="optional"))
     module("homeassistant.exceptions", HomeAssistantError=HomeAssistantError)
     module("homeassistant.helpers")
     module("homeassistant.helpers.config_validation", string=str, entity_id=str)
@@ -175,13 +176,80 @@ class CaptureTests(unittest.IsolatedAsyncioTestCase):
                 ("button", "eufy_sdk", "CAM123_refresh_last_event") else None,
         )
         called = []
+        original = self.hass.services.async_call
         async def press(*args, **kwargs):
-            called.append((args, kwargs))
+            if args[1] == "press":
+                called.append((args, kwargs))
+            else:
+                await original(*args, **kwargs)
         self.hass.services.async_call = press
+        records = {"image.front_door_last_event": SimpleNamespace(state="2026-10-19T12:02:00+00:00"),
+                   "event.front_door_detection": SimpleNamespace(state="2026-10-19T12:00:00+00:00", attributes={"event_type": "person"})}
+        self.hass.states = SimpleNamespace(get=records.get)
         call = SimpleNamespace(data={"entity_id": "image.front_door_last_event"}, context=object())
-        await self.hass.services.handlers["refresh_source"](call)
+        response = await self.hass.services.handlers["refresh_source"](call)
         self.assertEqual(called[0][0], ("button", "press", {}))
         self.assertEqual(called[0][1]["target"], {"entity_id": "button.renamed_refresh"})
+        self.assertEqual(self.index()["total_count"], 1)
+        self.assertEqual(response["status"], "saved")
+        self.assertEqual(response["image_timestamp"], records["image.front_door_last_event"].state)
+        self.assertEqual(self.index()["images"][0]["date"], "2026-10-19")
+
+        # Pressing again with an already-loaded image has no new state edge. It
+        # must report unchanged, rather than silently pretending to have synced.
+        with patch.object(component, "REFRESH_SYNC_TIMEOUT_SECONDS", 0):
+            with self.assertRaisesRegex(component.HomeAssistantError, "already contains the same image"):
+                await self.hass.services.handlers["refresh_source"](call)
+        self.assertEqual(self.index()["total_count"], 1)
+
+
+    def prepare_refresh(self, records):
+        self.hass.registry = SimpleNamespace(
+            async_get=lambda eid: SimpleNamespace(platform="eufy_sdk", unique_id="CAM_last_event"),
+            async_get_entity_id=lambda *args: "button.front_door_refresh_last_event")
+        self.hass.states = SimpleNamespace(get=records.get)
+        original = self.hass.services.async_call
+        async def route(domain, service, *args, **kwargs):
+            if service != "press":
+                await original(domain, service, *args, **kwargs)
+        self.hass.services.async_call = route
+        return SimpleNamespace(data={"entity_id": "image.front_door_last_event"}, context=object())
+
+    async def test_refresh_does_not_save_a_hidden_unclassified_image(self):
+        records = {
+            "image.front_door_last_event": SimpleNamespace(state="2026-10-19T12:30:00Z"),
+            "event.front_door_detection": SimpleNamespace(
+                state="2026-10-19T12:00:00Z", attributes={"event_type": "person"})}
+        call = self.prepare_refresh(records)
+        with patch.object(component, "REFRESH_SYNC_TIMEOUT_SECONDS", 0):
+            with self.assertRaisesRegex(component.HomeAssistantError, "no matching person/package"):
+                await self.hass.services.handlers["refresh_source"](call)
+        self.assertEqual(self.index()["total_count"], 0)
+        call.data["label"] = "package"
+        result = await self.hass.services.handlers["refresh_source"](call)
+        self.assertEqual(result["status"], "saved")
+        self.assertEqual(self.index()["counts"]["package"], 1)
+
+    async def test_refresh_waits_for_background_image_without_automation(self):
+        records = {"image.front_door_last_event": SimpleNamespace(state="unavailable")}
+        call = self.prepare_refresh(records)
+        async def deliver():
+            await asyncio.sleep(0.02)
+            records["image.front_door_last_event"] = SimpleNamespace(state="2026-10-19T12:02:00Z")
+            records["event.front_door_detection"] = SimpleNamespace(
+                state="2026-10-19T12:00:00Z", attributes={"event_type": "person"})
+        task = asyncio.create_task(deliver())
+        with patch.object(component, "REFRESH_SYNC_TIMEOUT_SECONDS", 2):
+            response = await self.hass.services.handlers["refresh_source"](call)
+        await task
+        self.assertEqual(response["status"], "saved")
+        self.assertEqual(self.index()["counts"]["person"], 1)
+
+    async def test_refresh_reports_no_image_instead_of_silent_success(self):
+        call = self.prepare_refresh({"image.front_door_last_event": SimpleNamespace(state="unavailable")})
+        with patch.object(component, "REFRESH_SYNC_TIMEOUT_SECONDS", 0):
+            with self.assertRaisesRegex(component.HomeAssistantError, "No usable Eufy Last event image"):
+                await self.hass.services.handlers["refresh_source"](call)
         self.assertEqual(self.index()["total_count"], 0)
 
 

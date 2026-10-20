@@ -20,7 +20,7 @@ variables:
         {% set age = as_timestamp(trigger.to_state.state, 0) - as_timestamp(detection, 0) %}
         {{ kind if kind in ['person', 'stranger', 'package_delivered',
                             'package_taken', 'package_stranded', 'motion']
-                   and 0 <= age <= 60 else 'image_update' }}
+                   and -5 <= age <= 300 else 'image_update' }}
 actions:
   - action: front_door_timeline.capture
     data:
@@ -28,3 +28,4 @@ actions:
       label: "{{ event_label }}"
 mode: queued
 max: 10
+

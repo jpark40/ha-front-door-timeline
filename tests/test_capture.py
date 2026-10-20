@@ -35,6 +35,7 @@ def load_component():
     module("homeassistant.exceptions", HomeAssistantError=HomeAssistantError)
     module("homeassistant.helpers")
     module("homeassistant.helpers.config_validation", string=str, entity_id=str)
+    module("homeassistant.helpers.entity_registry", async_get=lambda hass: hass.registry)
     module("homeassistant.helpers.event", async_track_time_change=lambda *a, **kw: lambda: None)
     component = Path(__file__).resolve().parents[1] / "custom_components/front_door_timeline"
     spec = importlib.util.spec_from_file_location(
@@ -83,6 +84,7 @@ class FakeHass:
         self.data = {}
         self.services = FakeServices()
         self.http = SimpleNamespace(register_view=lambda view: None)
+        self.states = SimpleNamespace(get=lambda entity_id: None)
 
     async def async_add_executor_job(self, function, *args):
         return await asyncio.to_thread(function, *args)
@@ -142,6 +144,45 @@ class CaptureTests(unittest.IsolatedAsyncioTestCase):
             await self.capture(entity="camera.front_door_2")
         self.assertEqual(self.index()["total_count"], 1)
         self.assertEqual(self.hass.services.calls[0][0], "camera")
+
+    async def test_late_eufy_cover_stays_in_person_tab_with_old_automation(self):
+        records = {
+            "image.front_door_last_event": SimpleNamespace(state="2026-10-19T12:04:00+00:00"),
+            "event.front_door_detection": SimpleNamespace(
+                state="2026-10-19T12:00:00+00:00", attributes={"event_type": "person"}),
+        }
+        self.hass.states = SimpleNamespace(get=records.get)
+        await self.capture("image_update")
+        self.assertEqual(self.index()["counts"]["person"], 1)
+        self.assertEqual(self.index()["images"][0]["label"], "Person")
+
+    async def test_stale_detection_does_not_mislabel_a_new_thumbnail(self):
+        records = {
+            "image.front_door_last_event": SimpleNamespace(state="2026-10-19T12:10:00+00:00"),
+            "event.front_door_detection": SimpleNamespace(
+                state="2026-10-19T12:00:00+00:00", attributes={"event_type": "person"}),
+        }
+        self.hass.states = SimpleNamespace(get=records.get)
+        await self.capture("image_update")
+        self.assertEqual(self.index()["counts"]["person"], 0)
+        self.assertEqual(self.index()["images"][0]["label"], "Image Update")
+
+    async def test_refresh_resolves_sdk_button_even_after_entity_rename(self):
+        self.hass.registry = SimpleNamespace(
+            async_get=lambda eid: SimpleNamespace(platform="eufy_sdk", unique_id="CAM123_last_event"),
+            async_get_entity_id=lambda domain, platform, unique_id:
+                "button.renamed_refresh" if (domain, platform, unique_id) ==
+                ("button", "eufy_sdk", "CAM123_refresh_last_event") else None,
+        )
+        called = []
+        async def press(*args, **kwargs):
+            called.append((args, kwargs))
+        self.hass.services.async_call = press
+        call = SimpleNamespace(data={"entity_id": "image.front_door_last_event"}, context=object())
+        await self.hass.services.handlers["refresh_source"](call)
+        self.assertEqual(called[0][0], ("button", "press", {}))
+        self.assertEqual(called[0][1]["target"], {"entity_id": "button.renamed_refresh"})
+        self.assertEqual(self.index()["total_count"], 0)
 
 
 if __name__ == "__main__":

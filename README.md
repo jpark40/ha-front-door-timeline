@@ -2,7 +2,7 @@
 
 ![Repository icon](icon.png)
 
-Version 1.0.8 prevents an unchanged thumbnail from being saved repeatedly under new timestamps. The optional Eufy SDK capture automation continues to label snapshots from `event.front_door_detection`.
+Version 1.0.9 handles delayed Eufy SDK event images, exposes source freshness to the card, and adds a supported source-refresh action. Version 1.0.8's unchanged-image protection is retained.
 
 ## Install or migrate
 
@@ -23,6 +23,52 @@ Install an available update through HACS and restart HA. Keep `VERSION` and `cus
 This repository contains one integration, as required by HACS. It is intended to be added as a custom repository; default-catalog submission is separate.
 
 ## Front-door capture automation
+
+### Eufy SDK compatibility in 1.0.9
+
+Reviewed against the stable **eufy-sdk integration 0.6.0**, **bridge 0.6.0**,
+and **bridge add-on 0.7.0** released October 16, 2026. These are separate version
+numbers; see the [integration release](https://github.com/mega-yfue/ha-eufy-sdk/releases/tag/0.6.0)
+and [add-on release](https://github.com/mega-yfue/ha-eufy-sdk-addon/releases/tag/0.7.0).
+
+The bridge can retry a local HomeBase cover for **240 seconds**. The old example's
+60-second label window could save that valid late image as `image_update`, which
+the Person/Package tabs hide. When an existing automation supplies `image_update`
+for an SDK `image.*_last_event`, the backend now checks the corresponding
+`event.*_detection` timestamp and accepts a known Person/Package label within
+300 seconds (plus a five-second reverse-order allowance). It uses the image's
+timestamp rather than the time a queued capture executes. Older detections and
+unknown types are not used. Explicit capture labels retain their meaning.
+
+The existing automation can stay in place. For new installations the example
+also uses the 300-second bound. The image and detection entity names must follow
+the documented SDK naming pair; renamed pairs need the explicit automation label.
+Historical `image_update` snapshots cannot be classified reliably without their
+original detection metadata and are not automatically relabeled.
+
+Update **both** this integration and `ha-custom-dashboards` to **1.0.9**, restart
+HA, and fully reload each dashboard/Fully Kiosk page. The card now follows new
+dates and frames, and shows a warning when Eufy reports detections but its event
+image remains older by more than five minutes.
+
+To request a fresh stored event cover through the SDK's supported button, run:
+
+```yaml
+action: front_door_timeline.refresh_source
+data:
+  entity_id: image.front_door_last_event
+```
+
+The matching button is resolved by its registry unique ID, so a renamed button
+still works. Eufy can complete the refresh in the background and then update the
+image entity; the existing image automation captures it. This action does not
+start a live stream. It cannot force a HomeBase to return a cover it has not
+provided. The bridge's [current HomeBase 3 report](https://github.com/mega-yfue/ha-eufy-sdk-bridge/issues/134)
+and [troubleshooting guide](https://github.com/mega-yfue/ha-eufy-sdk-bridge/blob/main/docs/troubleshooting.md)
+describe cached thumbnails, missing local covers, and push/DNS failures. If the
+source stays stale, inspect bridge log entries containing `/event-image`,
+`local refresh`, `force refresh`, or `cover reply`; a `200 cached thumbnail` is
+not confirmation that a fresh frame arrived.
 
 The optional automation example watches `image.front_door_last_event` and captures that image entity. Replace your prior capture automation only if needed; do not install both. YAML examples are not automatically applied by HACS. The example stores current detection types from `event.front_door_detection` as labels for the Person and Package dashboard tabs. Replace the actions/triggers in your existing automation, keeping its ID. Do not add a duplicate. Unknown or stale detection metadata uses `image_update` and appears in neither the Person nor Package tab. Capture is triggered by a new image timestamp; a detection alone does not mean a new thumbnail is available.
 

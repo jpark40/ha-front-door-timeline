@@ -20,6 +20,7 @@ from homeassistant.const import ATTR_ENTITY_ID
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.event import async_track_time_change
 
 from .const import (
@@ -34,6 +35,7 @@ from .const import (
     SERVICE_CLEANUP,
 )
 from .snapshot import SNAPSHOT_RE, finalize_snapshot
+from .event_label import delayed_image_label, detection_entity_for
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -180,6 +182,18 @@ class TimelineIndexView(HomeAssistantView):
         payload = await self._hass.async_add_executor_job(
             _build_index, self._directory, requested_date
         )
+        states = getattr(self._hass, "states", None)
+        source_id = self._hass.data[DOMAIN].get("source_entity", "image.front_door_last_event")
+        detection_id = detection_entity_for(source_id)
+        source = states.get(source_id) if states is not None else None
+        detection = states.get(detection_id) if states is not None and detection_id else None
+        payload["source_status"] = {
+            "image_entity": source_id,
+            "image_updated": source.state if source else None,
+            "detection_entity": detection_id,
+            "detection_updated": detection.state if detection else None,
+            "event_type": detection.attributes.get("event_type") if detection else None,
+        }
         return web.json_response(payload)
 
 
@@ -244,11 +258,29 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
                 "front_door_timeline.capture requires a camera or image entity"
             )
 
+        hass.data[DOMAIN]["source_entity"] = entity_id
+
         # Separate automations may call this service concurrently. Serialize the
         # complete capture/compare/commit operation so neither can save a copy.
         async with capture_lock:
             now = datetime.now().astimezone()
             label = _safe_label(call.data[ATTR_LABEL])
+            # Older installed automations use image_update after 60 s. The current
+            # bridge may deliver a valid HomeBase cover up to four minutes later.
+            # Recover only a bounded, known classification; leave explicit labels
+            # and unrelated/manual captures alone.
+            detection_id = detection_entity_for(entity_id)
+            states = getattr(hass, "states", None)
+            if label == "image_update" and detection_id and states is not None:
+                source = states.get(entity_id)
+                detection = states.get(detection_id)
+                if source is not None and detection is not None:
+                    inferred = delayed_image_label(
+                        source.state, detection.state,
+                        detection.attributes.get("event_type"),
+                    )
+                    if inferred:
+                        label = inferred
             filename = (
                 f"front_door_{now:%Y-%m-%d_%H-%M-%S}-{now.microsecond:06d}_{label}.jpg"
             )
@@ -286,10 +318,30 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
     async def handle_cleanup(call: ServiceCall) -> None:
         await _async_cleanup()
 
+    async def handle_refresh_source(call: ServiceCall) -> None:
+        """Use the SDK's supported refresh control without guessing a button ID."""
+        source_id = call.data[ATTR_ENTITY_ID]
+        registry = er.async_get(hass)
+        source = registry.async_get(source_id)
+        if not source_id.startswith("image.") or source is None or source.platform != "eufy_sdk" or not source.unique_id.endswith("_last_event"):
+            raise HomeAssistantError("Select the Eufy SDK Last event image entity")
+        unique_id = source.unique_id[:-len("_last_event")] + "_refresh_last_event"
+        button_id = registry.async_get_entity_id("button", "eufy_sdk", unique_id)
+        if not button_id:
+            raise HomeAssistantError("Eufy SDK Refresh Last Event button was not found; check the integration version and enabled entities")
+        await hass.services.async_call(
+            "button", "press", {}, blocking=True, context=call.context,
+            target={ATTR_ENTITY_ID: button_id},
+        )
+
     hass.services.async_register(
         DOMAIN, SERVICE_CAPTURE, handle_capture, schema=CAPTURE_SCHEMA
     )
     hass.services.async_register(DOMAIN, SERVICE_CLEANUP, handle_cleanup)
+    hass.services.async_register(
+        DOMAIN, "refresh_source", handle_refresh_source,
+        schema=vol.Schema({vol.Required(ATTR_ENTITY_ID): cv.entity_id}),
+    )
 
     async def schedule_cleanup(_now: datetime) -> None:
         await _async_cleanup()

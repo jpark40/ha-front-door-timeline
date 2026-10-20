@@ -25,4 +25,17 @@ cleanup:
   name: Clean up old snapshots
   description: Delete timeline snapshots older than the configured retention period.
 
+refresh_source:
+  name: Refresh Eufy event image
+  description: Ask the matching Eufy SDK Refresh Last Event button to fetch a newer stored cover. The bridge can finish in the background; this does not start live video or guarantee a fresh frame.
+  fields:
+    entity_id:
+      name: Eufy SDK Last event image
+      required: true
+      selector:
+        entity:
+          filter:
+            - domain: image
+              integration: eufy_sdk
+
 

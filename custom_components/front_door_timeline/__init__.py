@@ -70,6 +70,36 @@ def _safe_label(value: str) -> str:
     return (cleaned or "event")[:40].lower()
 
 
+def _detection_entity_for(hass: HomeAssistant, image_entity: str) -> str | None:
+    """Resolve the SDK device pair even when HA has renamed an entity."""
+    if image_entity.startswith("image."):
+        registry = er.async_get(hass)
+        source = registry.async_get(image_entity)
+        if source and source.platform == "eufy_sdk" and source.unique_id.endswith("_last_event"):
+            unique_id = source.unique_id[:-len("_last_event")] + "_detection_event"
+            detection_id = registry.async_get_entity_id("event", "eufy_sdk", unique_id)
+            if detection_id:
+                return detection_id
+    return detection_entity_for(image_entity)
+
+
+def _source_status(hass: HomeAssistant, source_id: str) -> dict[str, Any]:
+    """Report entity metadata without downloading or refreshing an image."""
+    detection_id = _detection_entity_for(hass, source_id)
+    source = hass.states.get(source_id)
+    detection = hass.states.get(detection_id) if detection_id else None
+    kind = detection.attributes.get("event_type") if detection else None
+    return {
+        "image_entity": source_id,
+        "image_updated": source.state if source else None,
+        "detection_entity": detection_id,
+        "detection_updated": detection.state if detection else None,
+        "event_type": kind,
+        "matched_label": delayed_image_label(source.state, detection.state, kind)
+        if source and detection else None,
+    }
+
+
 def _snapshot_metadata(path: Path) -> dict[str, Any] | None:
     """Parse metadata only from files created by this integration."""
     match = SNAPSHOT_RE.fullmatch(path.name)
@@ -96,7 +126,9 @@ def _snapshot_metadata(path: Path) -> dict[str, Any] | None:
     }
 
 
-def _build_index(directory: Path, requested_date: str | None) -> dict[str, Any]:
+def _build_index(
+    directory: Path, requested_date: str | None, category: str | None = None,
+) -> dict[str, Any]:
     """Scan the snapshot directory and return the requested day's index."""
     all_items: list[dict[str, Any]] = []
 
@@ -113,17 +145,26 @@ def _build_index(directory: Path, requested_date: str | None) -> dict[str, Any]:
     all_items.sort(key=lambda item: (item["timestamp"], item["file"]))
     counts = Counter(item["date"] for item in all_items)
     category_counts = Counter()
+    category_dates: dict[str, Counter] = {"person": Counter(), "package": Counter()}
     for item in all_items:
         label = item["label"].lower().replace("_", " ").replace("-", " ")
+        item_category = None
         if re.match(r"^(person|stranger)( |$)", label):
-            category_counts["person"] += 1
+            item_category = "person"
         elif re.match(r"^package( |$)", label):
-            category_counts["package"] += 1
-    dates = [{"date": date, "count": counts[date]} for date in sorted(counts)]
+            item_category = "package"
+        if item_category:
+            category_counts[item_category] += 1
+            category_dates[item_category][item["date"]] += 1
+    dates = [{"date": date, "count": counts[date], "counts": {
+        name: date_counts[date] for name, date_counts in category_dates.items()
+    }} for date in sorted(counts)]
+    latest_dates = {name: max(date_counts, default=None)
+                    for name, date_counts in category_dates.items()}
+    latest_date = (latest_dates[category] if category in latest_dates
+                   else dates[-1]["date"] if dates else None)
 
-    selected_date = requested_date
-    if selected_date is None and dates:
-        selected_date = dates[-1]["date"]
+    selected_date = requested_date if requested_date is not None else latest_date
 
     images = (
         [item for item in all_items if item["date"] == selected_date]
@@ -134,8 +175,11 @@ def _build_index(directory: Path, requested_date: str | None) -> dict[str, Any]:
     return {
         "generated_at": datetime.now().astimezone().isoformat(),
         "selected_date": selected_date,
-        "latest_date": dates[-1]["date"] if dates else None,
+        "latest_date": latest_date,
+        "latest_dates": latest_dates,
         "total_count": len(all_items),
+        "hidden_count": len(all_items) - sum(category_counts.values()),
+        "label_counts": dict(Counter(item["label"] for item in all_items)),
         "counts": {
             "person": category_counts["person"],
             "package": category_counts["package"],
@@ -179,22 +223,15 @@ class TimelineIndexView(HomeAssistantView):
         requested_date = request.query.get("date")
         if requested_date and DATE_RE.fullmatch(requested_date) is None:
             raise web.HTTPBadRequest(text="date must use YYYY-MM-DD")
+        category = request.query.get("category")
+        if category is not None and category not in {"person", "package"}:
+            raise web.HTTPBadRequest(text="category must be person or package")
 
         payload = await self._hass.async_add_executor_job(
-            _build_index, self._directory, requested_date
+            _build_index, self._directory, requested_date, category
         )
-        states = getattr(self._hass, "states", None)
         source_id = self._hass.data[DOMAIN].get("source_entity", "image.front_door_last_event")
-        detection_id = detection_entity_for(source_id)
-        source = states.get(source_id) if states is not None else None
-        detection = states.get(detection_id) if states is not None and detection_id else None
-        payload["source_status"] = {
-            "image_entity": source_id,
-            "image_updated": source.state if source else None,
-            "detection_entity": detection_id,
-            "detection_updated": detection.state if detection else None,
-            "event_type": detection.attributes.get("event_type") if detection else None,
-        }
+        payload["source_status"] = _source_status(self._hass, source_id)
         return web.json_response(payload)
 
 
@@ -272,7 +309,7 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
             # bridge may deliver a valid HomeBase cover up to four minutes later.
             # Recover only a bounded, known classification; leave explicit labels
             # and unrelated/manual captures alone.
-            detection_id = detection_entity_for(entity_id)
+            detection_id = _detection_entity_for(hass, entity_id)
             states = getattr(hass, "states", None)
             if label == "image_update" and detection_id and states is not None:
                 source = states.get(entity_id)
@@ -331,6 +368,37 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
     async def handle_cleanup(call: ServiceCall) -> None:
         await _async_cleanup()
 
+    async def handle_diagnostics(call: ServiceCall) -> dict[str, Any]:
+        """Inspect retained files and SDK entities without changing either."""
+        source_id = call.data.get(ATTR_ENTITY_ID) or hass.data[DOMAIN].get(
+            "source_entity", "image.front_door_last_event"
+        )
+        storage: dict[str, Any] = {
+            "directory": str(directory), "retention_days": retention_days,
+        }
+        try:
+            index = await hass.async_add_executor_job(_build_index, directory, None)
+            for key in ("total_count", "counts", "hidden_count", "label_counts",
+                        "latest_dates", "dates"):
+                storage[key] = index[key]
+            storage["latest_day_snapshots"] = [
+                {key: item[key] for key in ("file", "date", "time", "label")}
+                for item in index["images"][-5:]
+            ]
+        except OSError as err:
+            storage["error"] = str(err)
+        registry = er.async_get(hass)
+        candidates = []
+        for entry in registry.entities.values():
+            if (entry.platform != "eufy_sdk" or not entry.entity_id.startswith("image.")
+                    or not entry.unique_id.endswith("_last_event")):
+                continue
+            state = hass.states.get(entry.entity_id)
+            candidates.append({"entity_id": entry.entity_id,
+                               "state": state.state if state else None})
+        return {"storage": storage, "source": _source_status(hass, source_id),
+                "eufy_image_entities": sorted(candidates, key=lambda item: item["entity_id"])}
+
     async def handle_refresh_source(call: ServiceCall) -> dict[str, Any]:
         """Request a refresh AND archive the image; do not depend on an automation edge."""
         source_id = call.data[ATTR_ENTITY_ID]
@@ -350,7 +418,7 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
         if explicit_label and not re.match(r"^(person|stranger|package)(_|-|$)", _safe_label(explicit_label)):
             raise HomeAssistantError("Choose a person or package label for the visible timeline tabs")
         states = hass.states
-        detection_id = detection_entity_for(source_id)
+        detection_id = _detection_entity_for(hass, source_id)
         deadline = asyncio.get_running_loop().time() + REFRESH_SYNC_TIMEOUT_SECONDS
         last_state = None
         result = None
@@ -401,6 +469,11 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
         DOMAIN, SERVICE_CAPTURE, handle_capture, schema=CAPTURE_SCHEMA
     )
     hass.services.async_register(DOMAIN, SERVICE_CLEANUP, handle_cleanup)
+    hass.services.async_register(
+        DOMAIN, "diagnostics", handle_diagnostics,
+        schema=vol.Schema({vol.Optional(ATTR_ENTITY_ID): cv.entity_id}),
+        supports_response=SupportsResponse.ONLY,
+    )
     hass.services.async_register(
         DOMAIN, "refresh_source", handle_refresh_source,
         schema=vol.Schema({vol.Required(ATTR_ENTITY_ID): cv.entity_id,

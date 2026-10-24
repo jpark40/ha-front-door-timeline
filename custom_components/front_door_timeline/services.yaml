@@ -25,6 +25,19 @@ cleanup:
   name: Clean up old snapshots
   description: Delete timeline snapshots older than the configured retention period.
 
+diagnostics:
+  name: Timeline diagnostics
+  description: Return the configured storage folder, saved label counts, latest dates, and Eufy entity states. This action does not capture, refresh, relabel, or delete images.
+  fields:
+    entity_id:
+      name: Source image entity
+      description: Optional source to inspect; defaults to the most recently used source or image.front_door_last_event.
+      required: false
+      selector:
+        entity:
+          filter:
+            - domain: image
+
 refresh_source:
   name: Refresh and sync Eufy event image
   description: Request the SDK cover, wait up to 20 seconds, and save the available classified image directly to the timeline using its original image timestamp. Reports when no newer image arrives. Live video is not started.

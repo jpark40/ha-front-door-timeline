@@ -32,7 +32,7 @@ def load_component():
     module("homeassistant.components.http", HomeAssistantView=object)
     module("homeassistant.const", ATTR_ENTITY_ID="entity_id")
     module("homeassistant.core", HomeAssistant=object, ServiceCall=object,
-           SupportsResponse=SimpleNamespace(OPTIONAL="optional"))
+           SupportsResponse=SimpleNamespace(OPTIONAL="optional", ONLY="only"))
     module("homeassistant.exceptions", HomeAssistantError=HomeAssistantError)
     module("homeassistant.helpers")
     module("homeassistant.helpers.config_validation", string=str, entity_id=str)
@@ -86,6 +86,11 @@ class FakeHass:
         self.services = FakeServices()
         self.http = SimpleNamespace(register_view=lambda view: None)
         self.states = SimpleNamespace(get=lambda entity_id: None)
+        self.registry = SimpleNamespace(
+            async_get=lambda entity_id: None,
+            async_get_entity_id=lambda *args: None,
+            entities={},
+        )
 
     async def async_add_executor_job(self, function, *args):
         return await asyncio.to_thread(function, *args)
@@ -206,7 +211,8 @@ class CaptureTests(unittest.IsolatedAsyncioTestCase):
     def prepare_refresh(self, records):
         self.hass.registry = SimpleNamespace(
             async_get=lambda eid: SimpleNamespace(platform="eufy_sdk", unique_id="CAM_last_event"),
-            async_get_entity_id=lambda *args: "button.front_door_refresh_last_event")
+            async_get_entity_id=lambda domain, *args:
+                "button.front_door_refresh_last_event" if domain == "button" else None)
         self.hass.states = SimpleNamespace(get=records.get)
         original = self.hass.services.async_call
         async def route(domain, service, *args, **kwargs):
@@ -251,6 +257,123 @@ class CaptureTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(component.HomeAssistantError, "No usable Eufy Last event image"):
                 await self.hass.services.handlers["refresh_source"](call)
         self.assertEqual(self.index()["total_count"], 0)
+
+    async def test_renamed_sdk_source_uses_detection_registry_pair(self):
+        source_id = "image.front_door_last_event_2"
+        detection_id = "event.front_door_detection_2"
+        source_entry = SimpleNamespace(platform="eufy_sdk", unique_id="CAM_last_event")
+        self.hass.registry = SimpleNamespace(
+            async_get=lambda entity_id: source_entry if entity_id == source_id else None,
+            async_get_entity_id=lambda domain, platform, unique_id: detection_id
+            if (domain, platform, unique_id) == ("event", "eufy_sdk", "CAM_detection_event") else None,
+            entities={},
+        )
+        records = {
+            source_id: SimpleNamespace(state="2026-10-23T12:02:00Z"),
+            detection_id: SimpleNamespace(state="2026-10-23T12:00:00Z",
+                                          attributes={"event_type": "stranger"}),
+        }
+        self.hass.states = SimpleNamespace(get=records.get)
+        await self.capture("image_update", source_id)
+        self.assertEqual(self.index()["counts"]["person"], 1)
+        self.assertEqual(self.index()["images"][0]["label"], "Stranger")
+
+    async def test_diagnostics_reports_hidden_files_and_candidates_without_mutation(self):
+        await self.capture("person")
+        await self.capture("image_update")
+        source_id = "image.front_door_last_event_2"
+        entry = SimpleNamespace(entity_id=source_id, platform="eufy_sdk",
+                                unique_id="CAM_last_event")
+        self.hass.registry.entities = {source_id: entry}
+        self.hass.states = SimpleNamespace(get=lambda entity_id:
+            SimpleNamespace(state="2026-10-23T12:00:00Z") if entity_id == source_id else None)
+        before = {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in self.directory.iterdir()}
+        call = SimpleNamespace(data={}, context=object())
+        calls_before = len(self.hass.services.calls)
+        result = await self.hass.services.handlers["diagnostics"](call)
+        self.assertEqual(result["storage"]["directory"], str(self.directory))
+        self.assertEqual(result["storage"]["total_count"], 2)
+        self.assertEqual(result["storage"]["counts"], {"person": 1, "package": 0})
+        self.assertEqual(result["storage"]["hidden_count"], 1)
+        self.assertEqual(result["storage"]["label_counts"], {"Person": 1, "Image Update": 1})
+        self.assertEqual(result["eufy_image_entities"], [
+            {"entity_id": source_id, "state": "2026-10-23T12:00:00Z"}])
+        self.assertEqual(result["source"]["image_entity"], "image.front_door_last_event")
+        self.assertIsNone(result["source"]["image_updated"])
+        self.assertEqual(len(self.hass.services.calls), calls_before)
+        self.assertEqual({p.name: (p.read_bytes(), p.stat().st_mtime_ns)
+                          for p in self.directory.iterdir()}, before)
+
+    async def test_diagnostics_reports_missing_storage_instead_of_zero_snapshots(self):
+        self.directory.rmdir()
+        call = SimpleNamespace(data={}, context=object())
+        result = await self.hass.services.handlers["diagnostics"](call)
+        self.assertIn("error", result["storage"])
+        self.assertNotIn("total_count", result["storage"])
+        self.assertFalse(self.directory.exists())
+
+    async def test_index_view_selects_latest_person_date_and_returns_source_status(self):
+        for date, label in (("2026-10-19", "stranger"), ("2026-10-23", "image_update")):
+            (self.directory / f"front_door_{date}_12-00-00_{label}.jpg").write_bytes(b"image")
+        view = component.TimelineIndexView(self.hass, self.directory)
+        with patch.object(component.web, "json_response", lambda payload: payload, create=True):
+            result = await view.get(SimpleNamespace(query={"category": "person"}))
+        self.assertEqual(result["selected_date"], "2026-10-19")
+        self.assertEqual(result["images"][0]["label"], "Stranger")
+        self.assertEqual(result["source_status"]["image_entity"], "image.front_door_last_event")
+
+    async def test_index_view_rejects_unknown_category(self):
+        class BadRequest(Exception):
+            def __init__(self, *, text):
+                super().__init__(text)
+        view = component.TimelineIndexView(self.hass, self.directory)
+        with patch.object(component.web, "HTTPBadRequest", BadRequest, create=True):
+            with self.assertRaisesRegex(BadRequest, "category must be person or package"):
+                await view.get(SimpleNamespace(query={"category": "all"}))
+
+
+class IndexTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.directory = Path(self.temp.name)
+
+    def save(self, date, label):
+        (self.directory / f"front_door_{date}_12-00-00-000001_{label}.jpg").write_bytes(b"image")
+
+    def test_latest_category_date_ignores_newer_hidden_and_other_category_images(self):
+        self.save("2026-10-19", "stranger")
+        self.save("2026-10-22", "package_delivered")
+        self.save("2026-10-23", "image_update")
+        result = component._build_index(self.directory, None, "person")
+        self.assertEqual(result["selected_date"], "2026-10-19")
+        self.assertEqual(result["latest_date"], "2026-10-19")
+        self.assertEqual(result["latest_dates"], {"person": "2026-10-19", "package": "2026-10-22"})
+        self.assertEqual([item["label"] for item in result["images"]], ["Stranger"])
+        self.assertEqual(result["dates"][-1]["counts"], {"person": 0, "package": 0})
+        result = component._build_index(self.directory, None, "package")
+        self.assertEqual(result["selected_date"], "2026-10-22")
+        self.assertEqual(result["counts"], {"person": 1, "package": 1})
+        # Existing API callers without a category retain their previous result.
+        self.assertEqual(component._build_index(self.directory, None)["selected_date"], "2026-10-23")
+
+    def test_explicit_empty_category_date_is_preserved(self):
+        self.save("2026-10-19", "person")
+        self.save("2026-10-23", "image_update")
+        result = component._build_index(self.directory, "2026-10-23", "person")
+        self.assertEqual(result["selected_date"], "2026-10-23")
+        self.assertEqual(result["images"][0]["label"], "Image Update")
+        self.assertEqual(result["latest_date"], "2026-10-19")
+
+    def test_only_hidden_files_do_not_claim_to_be_latest_person_or_package_history(self):
+        self.save("2026-10-23", "image_update")
+        result = component._build_index(self.directory, None, "person")
+        self.assertIsNone(result["selected_date"])
+        self.assertIsNone(result["latest_date"])
+        self.assertEqual(result["images"], [])
+        self.assertEqual(result["total_count"], 1)
+        self.assertEqual(result["hidden_count"], 1)
+        self.assertEqual(result["label_counts"], {"Image Update": 1})
 
 
 if __name__ == "__main__":

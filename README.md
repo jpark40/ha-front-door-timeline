@@ -2,7 +2,7 @@
 
 ![Repository icon](icon.png)
 
-Version 1.0.10 fixes Refresh source: it now saves the available image directly to the timeline, waits for a background image update, and reports clearly when no newer or classifiable image is available. Earlier delayed-image handling and duplicate protection are retained.
+Version 1.0.11 fixes an empty-history display case: Latest can now select the newest date containing the requested Person or Package category, even when newer captures have hidden labels. It also resolves Eufy detection entities through the entity registry after renaming and adds a read-only diagnostics action. Refresh source and duplicate protection are retained.
 
 ## Install or migrate
 
@@ -24,6 +24,43 @@ This repository contains one integration, as required by HACS. It is intended to
 
 ## Front-door capture automation
 
+### Empty timeline and retained history in 1.0.11
+
+Update this backend to **1.0.11** and `ha-custom-dashboards` to **1.0.10**.
+Restart HA and fully reload the dashboard/Fully Kiosk page. Latest follows the
+latest saved date for the selected tab. A day containing only `image_update` or
+`motion` files no longer hides an older day containing Person or Package images.
+Switching tabs while following Latest selects that tab's latest date. Choosing
+a date explicitly keeps that date selected, including when it has no matches.
+Tab counts still show the selected date's snapshots.
+
+The index accepts optional `category=person` or `category=package`. Its default
+without a category is unchanged. Images and both tab counts are available for
+the selected day; additional `latest_dates`, per-date category counts,
+`hidden_count`, and `label_counts` describe retained history.
+
+If the card is empty, run this in **Developer Tools → Actions** and inspect the
+action response:
+
+```yaml
+action: front_door_timeline.diagnostics
+data: {}
+```
+
+The response includes the configured storage directory, retention, file counts,
+saved labels, latest dates, recent filenames, current source/detection states,
+and registered Eufy Last event image entities. `hidden_count` counts saved files
+whose labels belong to neither visible tab. A missing/unreadable folder is
+reported as a storage error. No snapshots are captured, refreshed, relabeled,
+or deleted. An optional `entity_id` inspects another source image explicitly.
+
+The backend pairs Eufy source images and detections by registry unique IDs,
+including entity names with a `_2` suffix. This does not change an installed
+automation's watched entity: the diagnostics list helps identify when an
+automation still watches an unavailable entity after a reinstall. Reinstalling
+can also give a retained cached image a new SDK update timestamp; a timestamp
+alone does not establish the event's original capture time or classification.
+
 ### Eufy SDK compatibility in 1.0.9
 
 Reviewed against the stable **eufy-sdk integration 0.6.0**, **bridge 0.6.0**,
@@ -41,8 +78,9 @@ timestamp rather than the time a queued capture executes. Older detections and
 unknown types are not used. Explicit capture labels retain their meaning.
 
 The existing automation can stay in place. For new installations the example
-also uses the 300-second bound. The image and detection entity names must follow
-the documented SDK naming pair; renamed pairs need the explicit automation label.
+also uses the 300-second bound. In 1.0.11 the backend resolves renamed SDK
+source/detection pairs through the entity registry, falling back to the
+documented naming pair for other image sources.
 Historical `image_update` snapshots cannot be classified reliably without their
 original detection metadata and are not automatically relabeled.
 
@@ -75,7 +113,7 @@ adds no hidden `image_update` entry and reports the classification problem. Afte
 visually checking the source image, you can explicitly provide `label: person`
 or `label: package` to sync that verified category.
 
-Install backend **v1.0.10**, keep dashboard **v1.0.9 or later**, restart HA, and run
+Install backend **v1.0.11**, use dashboard **v1.0.10 or later**, restart HA, and run
 the action again. Regular automatic capture still uses the existing automation.
 This action does not start a live stream. It cannot force a HomeBase to return a cover it has not
 provided. The bridge's [current HomeBase 3 report](https://github.com/mega-yfue/ha-eufy-sdk-bridge/issues/134)

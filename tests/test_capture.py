@@ -30,14 +30,31 @@ def load_component():
     module("homeassistant")
     module("homeassistant.components")
     module("homeassistant.components.http", HomeAssistantView=object)
+    async def get_image(hass, entity_id):
+        return SimpleNamespace(content=hass.services.image)
+    module("homeassistant.components.image", async_get_image=get_image)
     module("homeassistant.const", ATTR_ENTITY_ID="entity_id")
     module("homeassistant.core", HomeAssistant=object, ServiceCall=object,
-           SupportsResponse=SimpleNamespace(OPTIONAL="optional", ONLY="only"))
+           SupportsResponse=SimpleNamespace(OPTIONAL="optional", ONLY="only"),
+           callback=lambda function: function)
     module("homeassistant.exceptions", HomeAssistantError=HomeAssistantError)
     module("homeassistant.helpers")
-    module("homeassistant.helpers.config_validation", string=str, entity_id=str)
+    module("homeassistant.helpers.config_validation", string=str, entity_id=str, boolean=bool)
     module("homeassistant.helpers.entity_registry", async_get=lambda hass: hass.registry)
-    module("homeassistant.helpers.event", async_track_time_change=lambda *a, **kw: lambda: None)
+    def track_states(hass, entity_ids, listener):
+        record = (entity_ids, listener)
+        hass.listeners.append(record)
+        return lambda: hass.listeners.remove(record)
+    module("homeassistant.helpers.event", async_track_time_change=lambda *a, **kw: lambda: None,
+           async_track_state_change_event=track_states)
+    class Store:
+        def __init__(self, hass, version, key):
+            self.hass, self.key = hass, key
+        async def async_load(self):
+            return self.hass.storage.get(self.key)
+        async def async_save(self, value):
+            self.hass.storage[self.key] = value
+    module("homeassistant.helpers.storage", Store=Store)
     component = Path(__file__).resolve().parents[1] / "custom_components/front_door_timeline"
     spec = importlib.util.spec_from_file_location(
         "_capture_test_component", component / "__init__.py",
@@ -64,7 +81,7 @@ class FakeServices:
     def async_register(self, domain, service, handler, **kwargs):
         self.handlers[service] = handler
 
-    async def async_call(self, domain, service, data, *, blocking, context, target):
+    async def async_call(self, domain, service, data, *, blocking, context=None, target):
         self.calls.append((domain, service, data, target))
         assert blocking and service == "snapshot"
         self.active += 1
@@ -86,6 +103,11 @@ class FakeHass:
         self.services = FakeServices()
         self.http = SimpleNamespace(register_view=lambda view: None)
         self.states = SimpleNamespace(get=lambda entity_id: None)
+        self.is_running = False
+        self.storage = {}
+        self.listeners = []
+        self.bus = SimpleNamespace(async_listen_once=lambda *args: None)
+        self.config = SimpleNamespace(time_zone="UTC")
         self.registry = SimpleNamespace(
             async_get=lambda entity_id: None,
             async_get_entity_id=lambda *args: None,
@@ -94,6 +116,9 @@ class FakeHass:
 
     async def async_add_executor_job(self, function, *args):
         return await asyncio.to_thread(function, *args)
+
+    def async_create_task(self, coro):
+        return asyncio.create_task(coro)
 
 
 class CaptureTests(unittest.IsolatedAsyncioTestCase):

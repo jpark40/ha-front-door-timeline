@@ -2,15 +2,16 @@
 
 ![Repository icon](icon.png)
 
-Version 1.0.11 fixes an empty-history display case: Latest can now select the newest date containing the requested Person or Package category, even when newer captures have hidden labels. It also resolves Eufy detection entities through the entity registry after renaming and adds a read-only diagnostics action. Refresh source and duplicate protection are retained.
+Version 1.0.12 adds automatic detection capture inside the integration. It observes Person/Package detections, retains their labels and event times, and saves the image when its bytes change. Pending metadata survives HA restart. A delayed cover no longer has to match the SDK's download timestamp within five minutes. The existing private snapshot history, API, manual services, and duplicate protection remain available.
 
 ## Install or migrate
 
 1. Back up Home Assistant, including the existing configuration and event history.
 2. Add `https://github.com/jpark40/ha-front-door-timeline` in **HACS > three dots > Custom repositories**, type **Integration**. Download it.
 3. Keep the existing `front_door_timeline:` block in `configuration.yaml`. For a fresh installation, merge `examples/configuration.yaml` at top level once. Do not paste a duplicate block.
-4. Restart Home Assistant. This integration uses YAML setup; no new UI configuration flow is introduced.
-5. Manage the matching card through `jpark40/ha-custom-dashboards`. The backend repository does not install JavaScript into `/config/www`.
+4. Turn off the old **Front Door - Save snapshots to timeline** automation. Automatic capture is enabled by default in 1.0.12, so that automation is no longer needed.
+5. Restart Home Assistant. This integration uses YAML setup; no new UI configuration flow is introduced.
+6. Update `jpark40/ha-custom-dashboards` to **1.0.11** and fully reload each browser/Fully Kiosk page. The backend repository does not install JavaScript into `/config/www`.
 
 HACS updates the same `/config/custom_components/front_door_timeline` directory. Do not uninstall the working integration before migrating. Event history remains in the directory configured by your existing YAML, outside the integration source. HACS does not move or delete it.
 
@@ -24,9 +25,57 @@ This repository contains one integration, as required by HACS. It is intended to
 
 ## Front-door capture automation
 
+### Automatic detection capture in 1.0.12
+
+Normal operation no longer needs a capture automation. With your existing
+configuration block, the integration watches `image.front_door_last_event` and
+resolves the matching Eufy SDK detection entity through registry unique IDs.
+Optional settings are:
+
+```yaml
+front_door_timeline:
+  directory: /media/front_door_snapshots
+  retention_days: 30
+  auto_capture: true
+  source_entity: image.front_door_last_event
+```
+
+Merge settings into the existing block. A renamed source can be specified with
+`source_entity`; the automatic source must be an Eufy SDK Last event image.
+To keep managing captures through a separate automation instead, explicitly set
+`auto_capture: false` before enabling that automation.
+
+The integration freezes each live Person, Stranger, or Package detection's
+label and timestamp, requests the SDK's supported Last event refresh, and
+compares image bytes against the baseline observed for that event. It writes
+those same checked bytes, rather than taking a second snapshot that could have
+advanced to another event. The filename uses the detection time in HA's
+configured timezone. The SDK image state is a download time and can reset when
+cached pictures are loaded after restart; it is not used as the event time.
+
+A changed image can arrive more than five minutes later while the same
+detection is still current. The pending event and baseline hash are persisted
+under HA's `.storage` folder, so a restart does not discard the association or
+turn an unchanged cached image into a new event. Subsequent detections supersede
+pending metadata, including types outside Person/Package. A five-second
+allowance handles an image state callback arriving just before its detection.
+Only hashes and event metadata are journaled; image history stays in the
+configured snapshot directory. Refresh requests are coalesced while one is
+already in flight and do not start live video.
+
+Dashboard 1.0.11 shows when capture is waiting for changed image bytes, when a
+source is unavailable, or when writing fails. The same information is returned
+as `source.capture` by `front_door_timeline.diagnostics`. A detection with no
+changed picture does not create a duplicate or a hidden `image_update` file.
+
+Detections from before tracking was installed cannot be reconstructed from
+cached image timestamps. Old unclassified snapshots are not automatically
+relabelled. The bridge still has to supply a usable event picture; if its bytes
+remain unchanged, the card reports that condition while retaining saved history.
+
 ### Empty timeline and retained history in 1.0.11
 
-Update this backend to **1.0.11** and `ha-custom-dashboards` to **1.0.10**.
+Use backend **1.0.12** and `ha-custom-dashboards` **1.0.11** for current behavior.
 Restart HA and fully reload the dashboard/Fully Kiosk page. Latest follows the
 latest saved date for the selected tab. A day containing only `image_update` or
 `motion` files no longer hides an older day containing Person or Package images.
@@ -77,14 +126,14 @@ for an SDK `image.*_last_event`, the backend now checks the corresponding
 timestamp rather than the time a queued capture executes. Older detections and
 unknown types are not used. Explicit capture labels retain their meaning.
 
-The existing automation can stay in place. For new installations the example
-also uses the 300-second bound. In 1.0.11 the backend resolves renamed SDK
+In legacy mode (`auto_capture: false`), the existing automation can stay in place.
+The legacy example uses the 300-second bound. In 1.0.11 the backend resolves renamed SDK
 source/detection pairs through the entity registry, falling back to the
 documented naming pair for other image sources.
 Historical `image_update` snapshots cannot be classified reliably without their
 original detection metadata and are not automatically relabeled.
 
-Update **both** this integration and `ha-custom-dashboards` to **1.0.9**, restart
+Update this integration to **1.0.12** and `ha-custom-dashboards` to **1.0.11**, restart
 HA, and fully reload each dashboard/Fully Kiosk page. The card now follows new
 dates and frames, and shows a warning when Eufy reports detections but its event
 image remains older by more than five minutes.
@@ -100,8 +149,9 @@ data:
 In **v1.0.10**, the action resolves the matching button by registry unique ID,
 requests a refresh, and archives the currently available classified image itself.
 It does not depend on the image automation firing a new state-change trigger.
-The saved filename uses the **source image timestamp**, so syncing an old cover
-does not make it look like a new event. Identical content is still suppressed.
+The manual action's filename uses the **source image update timestamp**. This
+timestamp can represent a cache reload rather than the event itself. Identical
+content is still suppressed. Automatic capture uses its tracked detection time.
 After the button returns, the action waits up to 20 seconds for a background
 image update if the existing image is already archived or unavailable. A saved
 image response contains its filename, label, and source timestamp. If nothing
@@ -113,8 +163,8 @@ adds no hidden `image_update` entry and reports the classification problem. Afte
 visually checking the source image, you can explicitly provide `label: person`
 or `label: package` to sync that verified category.
 
-Install backend **v1.0.11**, use dashboard **v1.0.10 or later**, restart HA, and run
-the action again. Regular automatic capture still uses the existing automation.
+Install backend **v1.0.12**, use dashboard **v1.0.11 or later**, and restart HA.
+Regular automatic capture now runs inside the integration; turn off the old automation.
 This action does not start a live stream. It cannot force a HomeBase to return a cover it has not
 provided. The bridge's [current HomeBase 3 report](https://github.com/mega-yfue/ha-eufy-sdk-bridge/issues/134)
 and [troubleshooting guide](https://github.com/mega-yfue/ha-eufy-sdk-bridge/blob/main/docs/troubleshooting.md)
@@ -123,7 +173,11 @@ source stays stale, inspect bridge log entries containing `/event-image`,
 `local refresh`, `force refresh`, or `cover reply`; a `200 cached thumbnail` is
 not confirmation that a fresh frame arrived.
 
-The optional automation example watches `image.front_door_last_event` and captures that image entity. Replace your prior capture automation only if needed; do not install both. YAML examples are not automatically applied by HACS. The example stores current detection types from `event.front_door_detection` as labels for the Person and Package dashboard tabs. Replace the actions/triggers in your existing automation, keeping its ID. Do not add a duplicate. Unknown or stale detection metadata uses `image_update` and appears in neither the Person nor Package tab. Capture is triggered by a new image timestamp; a detection alone does not mean a new thumbnail is available.
+The legacy automation example is for `auto_capture: false` only. It watches image
+timestamps and stores current detection types from `event.front_door_detection`.
+YAML examples are not automatically applied by HACS. Unknown or stale metadata
+uses `image_update`, hidden by the Person/Package tabs. Automatic capture in
+1.0.12 replaces this mechanism with detection tracking and changed-image checks.
 
 ### Repeated thumbnails
 
@@ -137,8 +191,7 @@ package and person events; a different image is always saved.
 
 Captures are serialized and written under a temporary filename before an atomic
 commit, so the API never indexes a partial snapshot. Existing snapshots are not
-deleted or relabeled by the update. Install **v1.0.8** in HACS and restart Home
-Assistant; the existing automation can stay as it is.
+deleted or relabeled by the update. Duplicate protection is retained in 1.0.12.
 
 To inspect skipped captures, temporarily enable info logging for
 `custom_components.front_door_timeline`. A skipped capture reports

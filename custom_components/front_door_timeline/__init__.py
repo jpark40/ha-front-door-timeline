@@ -4,24 +4,27 @@ from __future__ import annotations
 
 import asyncio
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timezone
 import logging
 from pathlib import Path
 import re
 from typing import Any
 from urllib.parse import quote
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from aiohttp import web
 import voluptuous as vol
 
 from homeassistant.components.http import HomeAssistantView
+from homeassistant.components.image import async_get_image
 from homeassistant.const import ATTR_ENTITY_ID
-from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
+from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import entity_registry as er
-from homeassistant.helpers.event import async_track_time_change
+from homeassistant.helpers.event import async_track_state_change_event, async_track_time_change
+from homeassistant.helpers.storage import Store
 
 from .const import (
     API_ROOT,
@@ -36,6 +39,7 @@ from .const import (
 )
 from .snapshot import SNAPSHOT_RE, finalize_snapshot
 from .event_label import delayed_image_label, detection_entity_for
+from .managed_capture import ManagedCapture
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -50,6 +54,8 @@ CONFIG_SCHEMA = vol.Schema(
                 vol.Optional(
                     CONF_RETENTION_DAYS, default=DEFAULT_RETENTION_DAYS
                 ): vol.All(vol.Coerce(int), vol.Range(min=1, max=3650)),
+                vol.Optional("auto_capture", default=True): cv.boolean,
+                vol.Optional("source_entity", default="image.front_door_last_event"): cv.entity_id,
             }
         )
     },
@@ -89,7 +95,7 @@ def _source_status(hass: HomeAssistant, source_id: str) -> dict[str, Any]:
     source = hass.states.get(source_id)
     detection = hass.states.get(detection_id) if detection_id else None
     kind = detection.attributes.get("event_type") if detection else None
-    return {
+    result = {
         "image_entity": source_id,
         "image_updated": source.state if source else None,
         "detection_entity": detection_id,
@@ -98,6 +104,10 @@ def _source_status(hass: HomeAssistant, source_id: str) -> dict[str, Any]:
         "matched_label": delayed_image_label(source.state, detection.state, kind)
         if source and detection else None,
     }
+    monitor = hass.data[DOMAIN].get("managed_capture")
+    if monitor is not None and monitor.source == source_id:
+        result["capture"] = dict(monitor.status)
+    return result
 
 
 def _snapshot_metadata(path: Path) -> dict[str, Any] | None:
@@ -275,6 +285,7 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
     hass.data[DOMAIN] = {
         CONF_DIRECTORY: directory,
         CONF_RETENTION_DAYS: retention_days,
+        "source_entity": component_config.get("source_entity", "image.front_door_last_event"),
     }
 
     hass.http.register_view(TimelineIndexView(hass, directory))
@@ -291,6 +302,7 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
     async def _async_capture(
         entity_id: str, requested_label: str, context: Any,
         image_time: datetime | None = None,
+        image_bytes: bytes | None = None,
     ) -> dict[str, Any]:
         entity_domain = entity_id.split(".", 1)[0]
         if entity_domain not in {"camera", "image"}:
@@ -303,7 +315,9 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
         # Separate automations may call this service concurrently. Serialize the
         # complete capture/compare/commit operation so neither can save a copy.
         async with capture_lock:
-            now = image_time.astimezone() if image_time else datetime.now().astimezone()
+            local_zone = getattr(getattr(hass, "config", None), "time_zone", None)
+            now = (image_time.astimezone(ZoneInfo(local_zone)) if image_time and local_zone
+                   else image_time.astimezone() if image_time else datetime.now().astimezone())
             label = _safe_label(requested_label)
             # Older installed automations use image_update after 60 s. The current
             # bridge may deliver a valid HomeBase cover up to four minutes later.
@@ -329,14 +343,17 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
             pending = directory / f".front_door_pending_{uuid4().hex}.jpg"
 
             try:
-                await hass.services.async_call(
-                    entity_domain,
-                    "snapshot",
-                    {"filename": str(pending)},
-                    blocking=True,
-                    context=context,
-                    target={ATTR_ENTITY_ID: entity_id},
-                )
+                if image_bytes is not None:
+                    await hass.async_add_executor_job(pending.write_bytes, image_bytes)
+                else:
+                    await hass.services.async_call(
+                        entity_domain,
+                        "snapshot",
+                        {"filename": str(pending)},
+                        blocking=True,
+                        context=context,
+                        target={ATTR_ENTITY_ID: entity_id},
+                    )
                 try:
                     kept = await hass.async_add_executor_job(
                         finalize_snapshot, pending, destination
@@ -359,7 +376,8 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
                 "status": "saved" if kept == destination and not already_existed else "unchanged",
                 "file": kept.name,
                 "label": label,
-                "image_timestamp": image_time.isoformat() if image_time else None,
+                "image_timestamp": image_time.isoformat() if image_time and image_bytes is None else None,
+                "event_timestamp": image_time.isoformat() if image_time and image_bytes is not None else None,
             }
 
     async def handle_capture(call: ServiceCall) -> None:
@@ -480,6 +498,99 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
                            vol.Optional(ATTR_LABEL): cv.string}),
         supports_response=SupportsResponse.OPTIONAL,
     )
+
+    if component_config.get("auto_capture", True):
+        source_id = hass.data[DOMAIN]["source_entity"]
+        journal = Store(hass, 1, f"{DOMAIN}.managed_capture")
+
+        def read_detection() -> tuple[str | None, str | None]:
+            detection_id = _detection_entity_for(hass, source_id)
+            state = hass.states.get(detection_id) if detection_id else None
+            return (state.state, state.attributes.get("event_type")) if state else (None, None)
+
+        async def read_image() -> bytes:
+            entry = er.async_get(hass).async_get(source_id)
+            state = hass.states.get(source_id)
+            if (entry is None or entry.platform != "eufy_sdk"
+                    or not entry.unique_id.endswith("_last_event")
+                    or state is None or state.state in {"unknown", "unavailable"}):
+                raise HomeAssistantError("Automatic capture is waiting for the Eufy SDK Last event image")
+            return bytes((await async_get_image(hass, source_id)).content)
+
+        async def capture_bytes(content: bytes, label: str, detected: datetime) -> dict:
+            return await _async_capture(source_id, label, None, detected, content)
+
+        async def refresh_image() -> None:
+            registry = er.async_get(hass)
+            entry = registry.async_get(source_id)
+            if (entry is None or entry.platform != "eufy_sdk"
+                    or not entry.unique_id.endswith("_last_event")):
+                raise HomeAssistantError("Eufy SDK source entity is unavailable")
+            unique_id = entry.unique_id[:-len("_last_event")] + "_refresh_last_event"
+            button_id = registry.async_get_entity_id("button", "eufy_sdk", unique_id)
+            if not button_id:
+                raise HomeAssistantError("Eufy SDK Refresh Last event button is unavailable")
+            await hass.services.async_call(
+                "button", "press", {}, blocking=True,
+                target={ATTR_ENTITY_ID: button_id},
+            )
+
+        monitor = ManagedCapture(
+            source_id, load=journal.async_load, save=journal.async_save,
+            read_image=read_image, read_detection=read_detection,
+            capture=capture_bytes, refresh=refresh_image,
+        )
+        hass.data[DOMAIN]["managed_capture"] = monitor
+        remove_listener = None
+        jobs: set[asyncio.Task] = set()
+
+        def run_job(coro) -> None:
+            async def guarded() -> None:
+                try:
+                    await coro
+                except Exception as err:
+                    monitor.status = {"state": "journal_error", "message": str(err)}
+                    _LOGGER.exception("Automatic front-door capture failed")
+            task = hass.async_create_task(guarded())
+            jobs.add(task)
+            task.add_done_callback(jobs.discard)
+
+        @callback
+        def source_changed(event) -> None:
+            state = event.data.get("new_state")
+            if state is None:
+                return
+            entity_id = event.data["entity_id"]
+            old = event.data.get("old_state")
+            if old is not None and old.state == state.state:
+                return
+            if entity_id == source_id:
+                run_job(monitor.image_changed())
+            else:
+                run_job(monitor.detection_changed(
+                    state.state, state.attributes.get("event_type"), datetime.now(timezone.utc)
+                ))
+
+        async def start_monitor(_event=None) -> None:
+            nonlocal remove_listener
+            await monitor.start()
+            detection_id = _detection_entity_for(hass, source_id)
+            watched = [source_id] + ([detection_id] if detection_id else [])
+            remove_listener = async_track_state_change_event(hass, watched, source_changed)
+
+        async def stop_monitor(_event) -> None:
+            if remove_listener:
+                remove_listener()
+            if monitor.initialized:
+                await monitor.flush()
+            for job in list(jobs):
+                job.cancel()
+
+        if hass.is_running:
+            await start_monitor()
+        else:
+            hass.bus.async_listen_once("homeassistant_started", start_monitor)
+        hass.bus.async_listen_once("homeassistant_stop", stop_monitor)
 
     async def schedule_cleanup(_now: datetime) -> None:
         await _async_cleanup()

@@ -18,6 +18,11 @@ def _time(value: str | None) -> datetime | None:
         return None
 
 
+def _stamp(value: str | None) -> str | None:
+    parsed = _time(value)
+    return parsed.astimezone(timezone.utc).isoformat() if parsed else None
+
+
 class ManagedCapture:
     """Persist a byte baseline and the latest live detection, not a fetch-time guess.
 
@@ -88,11 +93,12 @@ class ManagedCapture:
             saved = await self._load()
             if isinstance(saved, dict) and saved.get("source") == self.source:
                 self._digest = saved.get("digest")
-                self._last_detection = saved.get("last_detection")
+                self._last_detection = _stamp(saved.get("last_detection"))
                 pending = saved.get("pending")
                 if (isinstance(pending, dict) and _time(pending.get("timestamp"))
                         and pending.get("label") in DETECTION_LABELS):
                     self._pending = dict(pending)
+                    self._pending["timestamp"] = _stamp(pending["timestamp"])
                 if isinstance(saved.get("status"), dict):
                     self.status = dict(saved["status"])
         except Exception as err:
@@ -132,6 +138,7 @@ class ManagedCapture:
         detected = _time(timestamp)
         if detected is None:
             return
+        timestamp = _stamp(timestamp)
         fresh = -5 <= (observed_at - detected).total_seconds() <= 60
         request_refresh = False
         async with self._lock:
@@ -195,6 +202,7 @@ class ManagedCapture:
                 if self.status.get("state") in {"starting", "image_unavailable"}:
                     timestamp, label = self._read_detection()
                     if _time(timestamp) is not None and self._last_detection is None:
+                        timestamp = _stamp(timestamp)
                         self._last_detection = timestamp
                         self.status = {"state": "restored_detection", "event_timestamp": timestamp,
                                        "label": label,
@@ -210,6 +218,7 @@ class ManagedCapture:
                 self._waiting()  # Detection entities can restore after image entities.
                 await self._save(self._record())
                 return
+            timestamp = _stamp(timestamp)
             if timestamp != pending["timestamp"] or label != pending["label"]:
                 if _time(timestamp) < _time(pending["timestamp"]) or label is None:
                     self._waiting()

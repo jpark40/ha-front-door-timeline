@@ -81,6 +81,17 @@ class ManagedCaptureTests(unittest.IsolatedAsyncioTestCase):
         await self.monitor.image_changed()
         self.assertEqual(self.captured, [(self.image, "stranger", detected)])
 
+    async def test_equivalent_restored_timestamp_formats_preserve_the_same_event(self):
+        self.now = self.now.replace(microsecond=250000)
+        detected = self.now
+        await self.detect()
+        self.detection = ("2026-10-26T04:37:21.250Z", "person")
+        self.monitor = self.create_monitor()
+        await self.monitor.start()
+        self.image = b"new cover for the restored event"
+        await self.monitor.image_changed()
+        self.assertEqual(self.captured, [(self.image, "person", detected)])
+
     async def test_a_stored_detection_is_not_a_new_event_on_install(self):
         old = self.now - timedelta(minutes=31)
         self.detection = (old.isoformat(), "person")

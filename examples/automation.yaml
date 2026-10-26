@@ -1,3 +1,6 @@
+# Legacy manual mode only: set auto_capture: false before using this automation.
+# With backend 1.0.12+, automatic detection capture is enabled by default.
+# Turn off an existing copy of this automation when using automatic capture.
 alias: Front Door - Save snapshots to timeline
 description: Save each new Eufy SDK event image with its detection category.
 triggers:

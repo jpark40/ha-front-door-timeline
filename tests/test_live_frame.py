@@ -48,6 +48,8 @@ class LiveFrameTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, JPEG)
         self.assertIn("-rtsp_transport", args)
         self.assertIn("tcp", args)
+        self.assertIn("-timeout", args)
+        self.assertNotIn("-rw_timeout", args)
         self.assertEqual(args[args.index("-frames:v") + 1], "1")
         self.assertNotIn("/snapshot", " ".join(args))
         self.assertIn("rtsp://bridge:8554/CAMERA", args)
@@ -55,6 +57,7 @@ class LiveFrameTests(unittest.IsolatedAsyncioTestCase):
     async def test_http_live_stream_does_not_receive_rtsp_only_options(self):
         _, args = await self.run_frame(Process(), "http://bridge:3000/stream/CAMERA")
         self.assertNotIn("-rtsp_transport", args)
+        self.assertIn("-rw_timeout", args)
 
     async def test_no_video_source_fails_without_launching_a_decoder(self):
         with patch.object(live_module, "async_get_stream_source", AsyncMock(return_value=None)), \

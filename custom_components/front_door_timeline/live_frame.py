@@ -31,9 +31,11 @@ async def async_live_frame(hass, camera_entity: str) -> bytes:
                     f"No supported live video source is available for {camera_entity}"
                 )
             args = [get_ffmpeg_manager(hass).binary, "-hide_banner", "-loglevel", "error",
-                    "-nostdin", "-threads", "1", "-rw_timeout", "25000000"]
+                    "-nostdin", "-threads", "1"]
             if urlsplit(source).scheme.lower() in {"rtsp", "rtsps"}:
-                args.extend(["-rtsp_transport", "tcp"])
+                args.extend(["-rtsp_transport", "tcp", "-timeout", "25000000"])
+            else:
+                args.extend(["-rw_timeout", "25000000"])
             args.extend([
                 "-i", source, "-an", "-frames:v", "1", "-threads", "1",
                 "-vf", "scale=w='min(1920,iw)':h=-2", "-q:v", "3",

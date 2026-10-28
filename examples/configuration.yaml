@@ -1,7 +1,11 @@
 # Merge into the existing top-level block in /config/configuration.yaml.
-# These automatic-capture settings are also the defaults in 1.0.12+.
+# These automatic-capture settings are also the defaults in 1.0.13+.
 front_door_timeline:
   directory: /media/front_door_snapshots
   retention_days: 30
   auto_capture: true
   source_entity: image.front_door_last_event
+  live_fallback: true
+  # Optional: exact camera from which to decode live video if the event image stalls.
+  # Otherwise the matching Eufy camera is resolved by serial, including renamed entities.
+  # fallback_camera: camera.front_door_2

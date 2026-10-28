@@ -2,7 +2,7 @@
 
 ![Repository icon](icon.png)
 
-Version 1.0.12 adds automatic detection capture inside the integration. It observes Person/Package detections, retains their labels and event times, and saves the image when its bytes change. Pending metadata survives HA restart. A delayed cover no longer has to match the SDK's download timestamp within five minutes. The existing private snapshot history, API, manual services, and duplicate protection remain available.
+Version 1.0.13 adds a separate live-video source when Eufy's Last event image stops updating. For a new Person/Package detection, it first tries the event image, then decodes one frame from the matching camera's video stream if needed. It bypasses the SDK's normal camera snapshot endpoint, which can itself return an old stored picture. Existing history, categories, and duplicate protection remain available.
 
 ## Install or migrate
 
@@ -11,7 +11,7 @@ Version 1.0.12 adds automatic detection capture inside the integration. It obser
 3. Keep the existing `front_door_timeline:` block in `configuration.yaml`. For a fresh installation, merge `examples/configuration.yaml` at top level once. Do not paste a duplicate block.
 4. Turn off the old **Front Door - Save snapshots to timeline** automation. Automatic capture is enabled by default in 1.0.12, so that automation is no longer needed.
 5. Restart Home Assistant. This integration uses YAML setup; no new UI configuration flow is introduced.
-6. Update `jpark40/ha-custom-dashboards` to **1.0.11** and fully reload each browser/Fully Kiosk page. The backend repository does not install JavaScript into `/config/www`.
+6. Update `jpark40/ha-custom-dashboards` to **1.0.12** and fully reload each browser/Fully Kiosk page. The backend repository does not install JavaScript into `/config/www`.
 
 HACS updates the same `/config/custom_components/front_door_timeline` directory. Do not uninstall the working integration before migrating. Event history remains in the directory configured by your existing YAML, outside the integration source. HACS does not move or delete it.
 
@@ -24,6 +24,53 @@ Install an available update through HACS and restart HA. Keep `VERSION` and `cus
 This repository contains one integration, as required by HACS. It is intended to be added as a custom repository; default-catalog submission is separate.
 
 ## Front-door capture automation
+
+### Separate live-video fallback in 1.0.13
+
+The default fallback uses the camera with the same Eufy serial as
+`image.front_door_last_event`, including a renamed entity such as
+`camera.front_door_2`. No YAML change is normally necessary. If you want to
+choose a different live-video camera explicitly, merge these settings into
+your existing block:
+
+```yaml
+front_door_timeline:
+  directory: /media/front_door_snapshots
+  retention_days: 30
+  auto_capture: true
+  source_entity: image.front_door_last_event
+  live_fallback: true
+  fallback_camera: camera.front_door_2
+```
+
+After trying the SDK refresh and allowing two seconds for an event image,
+the integration opens the selected camera's live video source through FFmpeg
+and saves one JPEG frame. It never calls `camera.snapshot`, changes Eufy's
+snapshot policy, or accepts `/snapshot`'s cached fallback. The FFmpeg
+integration dependency loads automatically; a separate `ffmpeg:` block is
+not required on HAOS.
+
+The live request has a 30-second timeout and its decoder/consumer closes on
+success, failure, or HA shutdown. It can briefly wake a battery camera, once
+per eligible detection; it does not preload a continuous HA stream. Set
+`live_fallback: false` to use event images only. Set `fallback_camera` to
+another HA camera with a working RTSP/HTTP video stream to use that source
+instead of the matched Eufy camera.
+
+A live frame shows the scene **after detection**, not a recovered historical
+event thumbnail. Both the event time and actual frame acquisition time appear
+in diagnostics. Live frames older than 60 seconds after detection are rejected,
+and a restored detection from yesterday never triggers a new live capture.
+A newer detection or a primary event image arriving during video startup
+causes the superseded live result to be discarded. A failed attempt leaves
+the pending event eligible for a late primary image.
+
+`source.fallback` in diagnostics identifies the selected camera and method;
+`source.capture` reports `image_source: live_stream`, `camera_entity`, and
+`captured_at` after success, or `fallback_error` after failure. Dashboard
+1.0.12 shows these states and avoids warning about the old event image when
+a new live frame was saved. Live viewing must work on the selected camera;
+this cannot repair a camera or bridge that supplies neither events nor video.
 
 ### Automatic detection capture in 1.0.12
 
@@ -75,7 +122,7 @@ remain unchanged, the card reports that condition while retaining saved history.
 
 ### Empty timeline and retained history in 1.0.11
 
-Use backend **1.0.12** and `ha-custom-dashboards` **1.0.11** for current behavior.
+Use backend **1.0.13** and `ha-custom-dashboards` **1.0.12** for current behavior.
 Restart HA and fully reload the dashboard/Fully Kiosk page. Latest follows the
 latest saved date for the selected tab. A day containing only `image_update` or
 `motion` files no longer hides an older day containing Person or Package images.

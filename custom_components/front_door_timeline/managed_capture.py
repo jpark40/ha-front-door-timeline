@@ -42,6 +42,8 @@ class ManagedCapture:
         capture: Callable[[bytes, str, datetime], Awaitable[dict]],
         refresh: Callable[[], Awaitable[None]],
         now: Callable[[], datetime] | None = None,
+        fallback: Callable[[], Awaitable[tuple[bytes, str]]] | None = None,
+        fallback_delay: float = 2,
     ) -> None:
         self.source = source
         self._load = load
@@ -51,6 +53,9 @@ class ManagedCapture:
         self._capture = capture
         self._refresh = refresh
         self._now = now or (lambda: datetime.now(timezone.utc))
+        self._fallback = fallback
+        self._fallback_delay = fallback_delay
+        self._fallback_lock = asyncio.Lock()
         self._lock = asyncio.Lock()
         self._ready = asyncio.Event()
         self._digest: str | None = None
@@ -60,6 +65,7 @@ class ManagedCapture:
         self._changed_at: datetime | None = None
         self._refreshing = False
         self._seeding = True
+        self._notified_detections: set[str] = set()
         self.status: dict[str, Any] = {
             "state": "starting", "message": "Starting automatic detection capture.",
         }
@@ -76,16 +82,17 @@ class ManagedCapture:
 
     def _waiting(self) -> None:
         if self._pending:
-            refresh_error = (self.status.get("refresh_error") if
-                             self.status.get("event_timestamp") == self._pending["timestamp"] else None)
+            details = ({key: self.status[key] for key in
+                        ("refresh_error", "fallback_error", "fallback_state")
+                        if key in self.status} if
+                       self.status.get("event_timestamp") == self._pending["timestamp"] else {})
             self.status = {
                 "state": "waiting_for_image",
                 "event_timestamp": self._pending["timestamp"],
                 "label": self._pending["label"],
                 "message": "Detection received; Eufy has not supplied a changed event image.",
+                **details,
             }
-            if refresh_error:
-                self.status["refresh_error"] = refresh_error
 
     async def start(self) -> None:
         """Restore the pending event before handling queued state changes."""
@@ -101,6 +108,11 @@ class ManagedCapture:
                     self._pending["timestamp"] = _stamp(pending["timestamp"])
                 if isinstance(saved.get("status"), dict):
                     self.status = dict(saved["status"])
+                if self._pending and self.status.get("fallback_state") == "capturing":
+                    self.status.update(
+                        fallback_state="interrupted",
+                        fallback_error="Live capture was interrupted by restart; waiting for an event image or a new detection.",
+                    )
         except Exception as err:
             self.status = {"state": "journal_error", "message": str(err)}
         finally:
@@ -110,7 +122,9 @@ class ManagedCapture:
         finally:
             self._seeding = False
         if self._pending:
-            await self._refresh_once(self._pending["timestamp"])
+            timestamp = self._pending["timestamp"]
+            await self._refresh_once(timestamp)
+            await self._try_fallback(timestamp)
 
     async def _refresh_once(self, timestamp: str) -> None:
         """Coalesce a burst of detections into one supported bridge request."""
@@ -134,20 +148,27 @@ class ManagedCapture:
         self, timestamp: str | None, label: str | None, observed_at: datetime,
     ) -> None:
         """Freeze a new live event; restored entity states are not new events."""
-        await self._ready.wait()
         detected = _time(timestamp)
         if detected is None:
             return
         timestamp = _stamp(timestamp)
+        # A callback can arrive while startup is still loading the journal.
+        # Do not then mistake that callback's state for restored metadata when
+        # seeding the first image baseline.
+        self._notified_detections.add(timestamp)
+        await self._ready.wait()
         fresh = -5 <= (observed_at - detected).total_seconds() <= 60
         request_refresh = False
         async with self._lock:
             if timestamp == self._last_detection:
+                self._notified_detections.discard(timestamp)
                 return
             previous = _time(self._last_detection)
             if previous is not None and detected < previous:
+                self._notified_detections.discard(timestamp)
                 return  # An older restored state must not replace persisted intent.
             self._last_detection = timestamp
+            self._notified_detections.discard(timestamp)
             self._pending = None
             if fresh and label in DETECTION_LABELS:
                 baseline = self._digest
@@ -174,6 +195,76 @@ class ManagedCapture:
         await self.image_changed()
         if request_refresh:
             await self._refresh_once(timestamp)
+            await self._try_fallback(timestamp)
+
+    def _current_live_pending(self, timestamp: str) -> bool:
+        """A current-scene frame must never be filed as a historical detection."""
+        if not self._pending or self._pending["timestamp"] != timestamp:
+            return False
+        detected = _time(timestamp)
+        current, label = self._read_detection()
+        return (detected is not None and 0 <= (self._now() - detected).total_seconds() <= 60
+                and _stamp(current) == timestamp and label == self._pending["label"])
+
+    async def _try_fallback(self, timestamp: str) -> None:
+        """Take at most one live frame per new event, without blocking image updates."""
+        if self._fallback is None or not self._current_live_pending(timestamp):
+            return
+        await asyncio.sleep(self._fallback_delay)
+        await self.image_changed()
+        async with self._fallback_lock:
+            async with self._lock:
+                if (not self._current_live_pending(timestamp)
+                        or self._pending.get("fallback_attempted")):
+                    return
+                self._pending["fallback_attempted"] = True
+                self._waiting()
+                self.status["fallback_state"] = "capturing"
+                await self._save(self._record())
+            try:
+                content, camera = await self._fallback()
+                if not content:
+                    raise ValueError("The live video source returned an empty image")
+            except Exception as err:
+                async with self._lock:
+                    if self._current_live_pending(timestamp):
+                        self._waiting()
+                        self.status.update(fallback_state="failed", fallback_error=str(err))
+                        await self._save(self._record())
+                return
+            async with self._lock:
+                # A primary image or a newer detection may have arrived during
+                # stream startup. Discard these bytes rather than guess a label.
+                if not self._current_live_pending(timestamp):
+                    if self._pending and self._pending["timestamp"] == timestamp:
+                        self._waiting()
+                        self.status.update(fallback_state="expired",
+                                           fallback_error="Live frame arrived more than 60 seconds after detection; it was not archived as that event.")
+                        await self._save(self._record())
+                    return
+                pending = self._pending
+                if sha256(content).hexdigest() in {self._digest, pending.get("baseline")}:
+                    self._waiting()
+                    self.status.update(fallback_state="unchanged",
+                                       fallback_error="The live source returned the same image bytes; no duplicate was saved.")
+                    await self._save(self._record())
+                    return
+                try:
+                    result = await self._capture(content, pending["label"], _time(timestamp))
+                except Exception as err:
+                    self.status = {"state": "capture_error", "message": str(err),
+                                   "event_timestamp": timestamp, "label": pending["label"],
+                                   "image_source": "live_stream", "camera_entity": camera}
+                    await self._save(self._record())
+                    return
+                self._pending = None
+                self.status = {**result, "state": result["status"],
+                               "event_timestamp": timestamp, "label": pending["label"],
+                               "image_source": "live_stream", "camera_entity": camera,
+                               "captured_at": self._now().isoformat(),
+                               "message": "Saved a live camera frame after detection." if result["status"] == "saved"
+                               else "The same live frame is already saved for this category."}
+                await self._save(self._record())
 
     async def image_changed(self) -> None:
         """Save frozen bytes when they change for the still-current detection."""
@@ -201,7 +292,8 @@ class ManagedCapture:
             if pending is None:
                 if self.status.get("state") in {"starting", "image_unavailable"}:
                     timestamp, label = self._read_detection()
-                    if _time(timestamp) is not None and self._last_detection is None:
+                    if (_time(timestamp) is not None and self._last_detection is None
+                            and _stamp(timestamp) not in self._notified_detections):
                         timestamp = _stamp(timestamp)
                         self._last_detection = timestamp
                         self.status = {"state": "restored_detection", "event_timestamp": timestamp,

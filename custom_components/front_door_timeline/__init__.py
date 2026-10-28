@@ -40,6 +40,7 @@ from .const import (
 from .snapshot import SNAPSHOT_RE, finalize_snapshot
 from .event_label import delayed_image_label, detection_entity_for
 from .managed_capture import ManagedCapture
+from .live_frame import async_live_frame
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -56,6 +57,8 @@ CONFIG_SCHEMA = vol.Schema(
                 ): vol.All(vol.Coerce(int), vol.Range(min=1, max=3650)),
                 vol.Optional("auto_capture", default=True): cv.boolean,
                 vol.Optional("source_entity", default="image.front_door_last_event"): cv.entity_id,
+                vol.Optional("live_fallback", default=True): cv.boolean,
+                vol.Optional("fallback_camera"): cv.entity_id,
             }
         )
     },
@@ -107,7 +110,27 @@ def _source_status(hass: HomeAssistant, source_id: str) -> dict[str, Any]:
     monitor = hass.data[DOMAIN].get("managed_capture")
     if monitor is not None and monitor.source == source_id:
         result["capture"] = dict(monitor.status)
+        camera = _fallback_camera_for(hass, source_id)
+        camera_state = hass.states.get(camera) if camera else None
+        result["fallback"] = {
+            "enabled": hass.data[DOMAIN].get("live_fallback", True),
+            "method": "live_stream", "camera_entity": camera,
+            "camera_state": camera_state.state if camera_state else None,
+        }
     return result
+
+
+def _fallback_camera_for(hass: HomeAssistant, source_id: str) -> str | None:
+    """Use an explicit camera or the exact SDK serial pair, never a name guess."""
+    configured = hass.data[DOMAIN].get("fallback_camera")
+    if configured:
+        return configured if configured.startswith("camera.") else None
+    registry = er.async_get(hass)
+    source = registry.async_get(source_id)
+    if source and source.platform == "eufy_sdk" and source.unique_id.endswith("_last_event"):
+        unique_id = source.unique_id[:-len("_last_event")] + "_camera"
+        return registry.async_get_entity_id("camera", "eufy_sdk", unique_id)
+    return None
 
 
 def _snapshot_metadata(path: Path) -> dict[str, Any] | None:
@@ -286,6 +309,8 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
         CONF_DIRECTORY: directory,
         CONF_RETENTION_DAYS: retention_days,
         "source_entity": component_config.get("source_entity", "image.front_door_last_event"),
+        "live_fallback": component_config.get("live_fallback", True),
+        "fallback_camera": component_config.get("fallback_camera"),
     }
 
     hass.http.register_view(TimelineIndexView(hass, directory))
@@ -535,16 +560,25 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
                 target={ATTR_ENTITY_ID: button_id},
             )
 
+        async def live_fallback() -> tuple[bytes, str]:
+            camera = _fallback_camera_for(hass, source_id)
+            if not camera:
+                raise HomeAssistantError(
+                    "No matching live camera was found. Set fallback_camera to the front-door camera entity."
+                )
+            return await async_live_frame(hass, camera), camera
+
         monitor = ManagedCapture(
             source_id, load=journal.async_load, save=journal.async_save,
             read_image=read_image, read_detection=read_detection,
             capture=capture_bytes, refresh=refresh_image,
+            fallback=live_fallback if component_config.get("live_fallback", True) else None,
         )
         hass.data[DOMAIN]["managed_capture"] = monitor
         remove_listener = None
         jobs: set[asyncio.Task] = set()
 
-        def run_job(coro) -> None:
+        def run_job(coro) -> asyncio.Task:
             async def guarded() -> None:
                 try:
                     await coro
@@ -554,6 +588,7 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
             task = hass.async_create_task(guarded())
             jobs.add(task)
             task.add_done_callback(jobs.discard)
+            return task
 
         @callback
         def source_changed(event) -> None:
@@ -573,18 +608,23 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
 
         async def start_monitor(_event=None) -> None:
             nonlocal remove_listener
-            await monitor.start()
             detection_id = _detection_entity_for(hass, source_id)
             watched = [source_id] + ([detection_id] if detection_id else [])
             remove_listener = async_track_state_change_event(hass, watched, source_changed)
+            # Install callbacks before any bridge/decoder wait. They queue on
+            # the monitor's readiness gate while its persisted state loads.
+            await run_job(monitor.start())
 
         async def stop_monitor(_event) -> None:
             if remove_listener:
                 remove_listener()
             if monitor.initialized:
                 await monitor.flush()
-            for job in list(jobs):
+            pending_jobs = list(jobs)
+            for job in pending_jobs:
                 job.cancel()
+            if pending_jobs:
+                await asyncio.gather(*pending_jobs, return_exceptions=True)
 
         if hass.is_running:
             await start_monitor()

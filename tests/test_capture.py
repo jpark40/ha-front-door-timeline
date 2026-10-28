@@ -33,6 +33,10 @@ def load_component():
     async def get_image(hass, entity_id):
         return SimpleNamespace(content=hass.services.image)
     module("homeassistant.components.image", async_get_image=get_image)
+    async def get_stream_source(hass, entity_id):
+        return None
+    module("homeassistant.components.camera", async_get_stream_source=get_stream_source)
+    module("homeassistant.components.ffmpeg", get_ffmpeg_manager=lambda hass: SimpleNamespace(binary="ffmpeg"))
     module("homeassistant.const", ATTR_ENTITY_ID="entity_id")
     module("homeassistant.core", HomeAssistant=object, ServiceCall=object,
            SupportsResponse=SimpleNamespace(OPTIONAL="optional", ONLY="only"),
@@ -63,6 +67,7 @@ def load_component():
     result = importlib.util.module_from_spec(spec)
     with patch.dict(sys.modules, {**modules, spec.name: result}):
         spec.loader.exec_module(result)
+        result.live_frame_module = sys.modules[result.async_live_frame.__module__]
     return result
 
 

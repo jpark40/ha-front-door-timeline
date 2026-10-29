@@ -37,10 +37,9 @@ from .const import (
     SERVICE_CAPTURE,
     SERVICE_CLEANUP,
 )
-from .snapshot import SNAPSHOT_RE, finalize_snapshot
+from .snapshot import SNAPSHOT_RE, finalize_snapshot, finalize_event_snapshot
 from .event_label import delayed_image_label, detection_entity_for
 from .managed_capture import ManagedCapture
-from .live_frame import async_live_frame
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -57,7 +56,9 @@ CONFIG_SCHEMA = vol.Schema(
                 ): vol.All(vol.Coerce(int), vol.Range(min=1, max=3650)),
                 vol.Optional("auto_capture", default=True): cv.boolean,
                 vol.Optional("source_entity", default="image.front_door_last_event"): cv.entity_id,
-                vol.Optional("live_fallback", default=True): cv.boolean,
+                vol.Optional("detection_entity"): cv.entity_id,
+                # Accepted for existing configurations; live video is no longer used.
+                vol.Optional("live_fallback", default=False): cv.boolean,
                 vol.Optional("fallback_camera"): cv.entity_id,
             }
         )
@@ -69,6 +70,7 @@ CAPTURE_SCHEMA = vol.Schema(
     {
         vol.Required(ATTR_ENTITY_ID): cv.entity_id,
         vol.Optional(ATTR_LABEL, default="motion"): cv.string,
+        vol.Optional("event_timestamp"): cv.string,
     }
 )
 
@@ -81,6 +83,9 @@ def _safe_label(value: str) -> str:
 
 def _detection_entity_for(hass: HomeAssistant, image_entity: str) -> str | None:
     """Resolve the SDK device pair even when HA has renamed an entity."""
+    settings = hass.data.get(DOMAIN, {})
+    if image_entity == settings.get("source_entity") and settings.get("detection_entity"):
+        return settings["detection_entity"]
     if image_entity.startswith("image."):
         registry = er.async_get(hass)
         source = registry.async_get(image_entity)
@@ -110,27 +115,7 @@ def _source_status(hass: HomeAssistant, source_id: str) -> dict[str, Any]:
     monitor = hass.data[DOMAIN].get("managed_capture")
     if monitor is not None and monitor.source == source_id:
         result["capture"] = dict(monitor.status)
-        camera = _fallback_camera_for(hass, source_id)
-        camera_state = hass.states.get(camera) if camera else None
-        result["fallback"] = {
-            "enabled": hass.data[DOMAIN].get("live_fallback", True),
-            "method": "live_stream", "camera_entity": camera,
-            "camera_state": camera_state.state if camera_state else None,
-        }
     return result
-
-
-def _fallback_camera_for(hass: HomeAssistant, source_id: str) -> str | None:
-    """Use an explicit camera or the exact SDK serial pair, never a name guess."""
-    configured = hass.data[DOMAIN].get("fallback_camera")
-    if configured:
-        return configured if configured.startswith("camera.") else None
-    registry = er.async_get(hass)
-    source = registry.async_get(source_id)
-    if source and source.platform == "eufy_sdk" and source.unique_id.endswith("_last_event"):
-        unique_id = source.unique_id[:-len("_last_event")] + "_camera"
-        return registry.async_get_entity_id("camera", "eufy_sdk", unique_id)
-    return None
 
 
 def _snapshot_metadata(path: Path) -> dict[str, Any] | None:
@@ -155,7 +140,7 @@ def _snapshot_metadata(path: Path) -> dict[str, Any] | None:
         "timestamp": f"{date}T{time}",
         "label": label,
         "size": stat.st_size,
-        "url": f"{API_ROOT}/image/{quote(path.name, safe='')}",
+        "url": f"{API_ROOT}/image/{quote(path.name, safe='')}?v={stat.st_mtime_ns}",
     }
 
 
@@ -292,7 +277,7 @@ class TimelineImageView(HomeAssistantView):
 
         return web.FileResponse(
             path,
-            headers={"Cache-Control": "private, max-age=86400, immutable"},
+            headers={"Cache-Control": "private, no-cache"},
         )
 
 
@@ -309,8 +294,7 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
         CONF_DIRECTORY: directory,
         CONF_RETENTION_DAYS: retention_days,
         "source_entity": component_config.get("source_entity", "image.front_door_last_event"),
-        "live_fallback": component_config.get("live_fallback", True),
-        "fallback_camera": component_config.get("fallback_camera"),
+        "detection_entity": component_config.get("detection_entity"),
     }
 
     hass.http.register_view(TimelineIndexView(hass, directory))
@@ -366,6 +350,8 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
             destination = directory / filename
             already_existed = await hass.async_add_executor_job(destination.is_file)
             pending = directory / f".front_door_pending_{uuid4().hex}.jpg"
+            event_capture = image_bytes is not None and image_time is not None
+            event_status = None
 
             try:
                 if image_bytes is not None:
@@ -380,9 +366,15 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
                         target={ATTR_ENTITY_ID: entity_id},
                     )
                 try:
-                    kept = await hass.async_add_executor_job(
-                        finalize_snapshot, pending, destination
-                    )
+                    if event_capture:
+                        event_status = await hass.async_add_executor_job(
+                            finalize_event_snapshot, pending, destination
+                        )
+                        kept = destination
+                    else:
+                        kept = await hass.async_add_executor_job(
+                            finalize_snapshot, pending, destination
+                        )
                 except (OSError, ValueError) as err:
                     raise HomeAssistantError(str(err)) from err
             finally:
@@ -398,7 +390,7 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
             else:
                 _LOGGER.debug("Saved snapshot from %s to %s", entity_id, filename)
             return {
-                "status": "saved" if kept == destination and not already_existed else "unchanged",
+                "status": event_status or ("saved" if kept == destination and not already_existed else "unchanged"),
                 "file": kept.name,
                 "label": label,
                 "image_timestamp": image_time.isoformat() if image_time and image_bytes is None else None,
@@ -406,7 +398,21 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
             }
 
     async def handle_capture(call: ServiceCall) -> None:
-        await _async_capture(call.data[ATTR_ENTITY_ID], call.data[ATTR_LABEL], call.context)
+        entity_id = call.data[ATTR_ENTITY_ID]
+        timestamp = call.data.get("event_timestamp")
+        if timestamp is not None:
+            try:
+                detected = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                if detected.tzinfo is None:
+                    raise ValueError("timezone required")
+            except (ValueError, TypeError, AttributeError) as err:
+                raise HomeAssistantError("event_timestamp must be an ISO timestamp with a timezone") from err
+            if not entity_id.startswith("image."):
+                raise HomeAssistantError("event_timestamp capture requires an image entity")
+            content = bytes((await async_get_image(hass, entity_id)).content)
+            await _async_capture(entity_id, call.data[ATTR_LABEL], call.context, detected, content)
+        else:
+            await _async_capture(entity_id, call.data[ATTR_LABEL], call.context)
 
     async def handle_cleanup(call: ServiceCall) -> None:
         await _async_cleanup()
@@ -445,6 +451,15 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
     async def handle_refresh_source(call: ServiceCall) -> dict[str, Any]:
         """Request a refresh AND archive the image; do not depend on an automation edge."""
         source_id = call.data[ATTR_ENTITY_ID]
+        monitor = hass.data[DOMAIN].get("managed_capture")
+        if (monitor is not None and monitor.source == source_id
+                and monitor.initialized and not call.data.get(ATTR_LABEL)):
+            # Normal automatic mode uses exactly the configured image/event
+            # pair, with no bridge button or timestamp-gap requirement.
+            try:
+                return await monitor.sync_current()
+            except ValueError as err:
+                raise HomeAssistantError(str(err)) from err
         registry = er.async_get(hass)
         source = registry.async_get(source_id)
         if not source_id.startswith("image.") or source is None or source.platform != "eufy_sdk" or not source.unique_id.endswith("_last_event"):
@@ -534,45 +549,17 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
             return (state.state, state.attributes.get("event_type")) if state else (None, None)
 
         async def read_image() -> bytes:
-            entry = er.async_get(hass).async_get(source_id)
-            state = hass.states.get(source_id)
-            if (entry is None or entry.platform != "eufy_sdk"
-                    or not entry.unique_id.endswith("_last_event")
-                    or state is None or state.state in {"unknown", "unavailable"}):
-                raise HomeAssistantError("Automatic capture is waiting for the Eufy SDK Last event image")
+            # HA's image proxy reads through this API too. Available image bytes
+            # are authoritative; the SDK's update timestamp is not an event ID.
             return bytes((await async_get_image(hass, source_id)).content)
 
         async def capture_bytes(content: bytes, label: str, detected: datetime) -> dict:
             return await _async_capture(source_id, label, None, detected, content)
 
-        async def refresh_image() -> None:
-            registry = er.async_get(hass)
-            entry = registry.async_get(source_id)
-            if (entry is None or entry.platform != "eufy_sdk"
-                    or not entry.unique_id.endswith("_last_event")):
-                raise HomeAssistantError("Eufy SDK source entity is unavailable")
-            unique_id = entry.unique_id[:-len("_last_event")] + "_refresh_last_event"
-            button_id = registry.async_get_entity_id("button", "eufy_sdk", unique_id)
-            if not button_id:
-                raise HomeAssistantError("Eufy SDK Refresh Last event button is unavailable")
-            await hass.services.async_call(
-                "button", "press", {}, blocking=True,
-                target={ATTR_ENTITY_ID: button_id},
-            )
-
-        async def live_fallback() -> tuple[bytes, str]:
-            camera = _fallback_camera_for(hass, source_id)
-            if not camera:
-                raise HomeAssistantError(
-                    "No matching live camera was found. Set fallback_camera to the front-door camera entity."
-                )
-            return await async_live_frame(hass, camera), camera
-
         monitor = ManagedCapture(
             source_id, load=journal.async_load, save=journal.async_save,
             read_image=read_image, read_detection=read_detection,
-            capture=capture_bytes, refresh=refresh_image,
-            fallback=live_fallback if component_config.get("live_fallback", True) else None,
+            capture=capture_bytes,
         )
         hass.data[DOMAIN]["managed_capture"] = monitor
         remove_listener = None
@@ -597,11 +584,13 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
                 return
             entity_id = event.data["entity_id"]
             old = event.data.get("old_state")
-            if old is not None and old.state == state.state:
-                return
             if entity_id == source_id:
                 run_job(monitor.image_changed())
             else:
+                if (old is not None and old.state == state.state
+                        and old.attributes.get("event_type") == state.attributes.get("event_type")):
+                    return
+                monitor.note_detection(state.state, state.attributes.get("event_type"))
                 run_job(monitor.detection_changed(
                     state.state, state.attributes.get("event_type"), datetime.now(timezone.utc)
                 ))
@@ -611,7 +600,7 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
             detection_id = _detection_entity_for(hass, source_id)
             watched = [source_id] + ([detection_id] if detection_id else [])
             remove_listener = async_track_state_change_event(hass, watched, source_changed)
-            # Install callbacks before any bridge/decoder wait. They queue on
+            # Install callbacks before loading persisted state. They queue on
             # the monitor's readiness gate while its persisted state loads.
             await run_job(monitor.start())
 

@@ -1,6 +1,6 @@
 capture:
   name: Capture timeline snapshot
-  description: Save a timestamped snapshot unless its image bytes and label match the previous capture. Unchanged images are skipped successfully.
+  description: Save an image or camera snapshot. Supply event_timestamp to keep one snapshot per detection and update that same file if its image changes. Without it, unchanged image bytes and labels are suppressed.
   fields:
     entity_id:
       name: Camera or image entity
@@ -18,6 +18,12 @@ capture:
       description: Short label shown below the image, such as motion, person, or doorbell.
       required: false
       default: motion
+      selector:
+        text:
+    event_timestamp:
+      name: Detection timestamp
+      description: Optional timestamp from the detection event. Must include a timezone. Requires an image entity.
+      required: false
       selector:
         text:
 
@@ -39,8 +45,8 @@ diagnostics:
             - domain: image
 
 refresh_source:
-  name: Refresh and sync Eufy event image
-  description: Request the SDK cover, wait up to 20 seconds, and save the available classified image directly to the timeline using its original image timestamp. Reports when no newer image arrives. Live video is not started.
+  name: Sync Eufy Last event image
+  description: In automatic mode, save image.front_door_last_event for the current relevant detection using its event type and timestamp. Does not require the image timestamp or bytes to change. Legacy manual mode can request the SDK refresh control.
   fields:
     entity_id:
       name: Eufy SDK Last event image

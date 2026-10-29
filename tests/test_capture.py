@@ -33,10 +33,6 @@ def load_component():
     async def get_image(hass, entity_id):
         return SimpleNamespace(content=hass.services.image)
     module("homeassistant.components.image", async_get_image=get_image)
-    async def get_stream_source(hass, entity_id):
-        return None
-    module("homeassistant.components.camera", async_get_stream_source=get_stream_source)
-    module("homeassistant.components.ffmpeg", get_ffmpeg_manager=lambda hass: SimpleNamespace(binary="ffmpeg"))
     module("homeassistant.const", ATTR_ENTITY_ID="entity_id")
     module("homeassistant.core", HomeAssistant=object, ServiceCall=object,
            SupportsResponse=SimpleNamespace(OPTIONAL="optional", ONLY="only"),
@@ -67,7 +63,6 @@ def load_component():
     result = importlib.util.module_from_spec(spec)
     with patch.dict(sys.modules, {**modules, spec.name: result}):
         spec.loader.exec_module(result)
-        result.live_frame_module = sys.modules[result.async_live_frame.__module__]
     return result
 
 
@@ -180,6 +175,22 @@ class CaptureTests(unittest.IsolatedAsyncioTestCase):
             await self.capture(entity="camera.front_door_2")
         self.assertEqual(self.index()["total_count"], 1)
         self.assertEqual(self.hass.services.calls[0][0], "camera")
+
+    async def test_legacy_detection_automation_keeps_one_file_per_event(self):
+        async def capture_event(timestamp):
+            await self.hass.services.handlers["capture"](SimpleNamespace(data={
+                "entity_id": "image.front_door_last_event", "label": "package_taken",
+                "event_timestamp": timestamp}, context=None))
+        await capture_event("2026-10-29T12:00:00Z")
+        await capture_event("2026-10-29T12:00:00+00:00")
+        self.assertEqual(self.index()["total_count"], 1)
+        await capture_event("2026-10-29T12:01:00Z")
+        self.assertEqual(self.index()["counts"]["package"], 2)
+        self.hass.services.image = b"late package picture"
+        await capture_event("2026-10-29T12:01:00Z")
+        self.assertEqual(self.index()["total_count"], 2)
+        self.assertEqual((self.directory / self.index()["images"][-1]["file"]).read_bytes(), self.hass.services.image)
+        self.assertEqual(self.hass.services.calls, [])
 
     async def test_late_eufy_cover_stays_in_person_tab_with_old_automation(self):
         records = {

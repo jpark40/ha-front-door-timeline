@@ -5,7 +5,7 @@ from datetime import datetime
 
 MAX_IMAGE_DELAY_SECONDS = 300  # Bridge local-cover retries run for up to 240 s.
 DETECTION_LABELS = frozenset({
-    "person", "stranger", "package_delivered", "package_taken", "package_stranded",
+    "person", "stranger", "package_delivered", "package_taken",
 })
 
 

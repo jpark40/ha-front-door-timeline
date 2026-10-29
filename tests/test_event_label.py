@@ -11,7 +11,7 @@ spec.loader.exec_module(labels)
 
 class EventLabelTests(unittest.TestCase):
     def test_bridge_four_minute_retry_and_small_reverse_order_are_supported(self):
-        for kind in ('person', 'stranger', 'package_delivered', 'package_taken', 'package_stranded'):
+        for kind in ('person', 'stranger', 'package_delivered', 'package_taken'):
             for image_time in ('12:04:00', '11:59:58'):
                 self.assertEqual(labels.delayed_image_label(
                     '2026-10-19T' + image_time + '+00:00',
@@ -21,6 +21,7 @@ class EventLabelTests(unittest.TestCase):
         for state in ('unknown', 'unavailable', '', '2026-10-19T12:06:00Z', '2026-10-19T11:59:54Z'):
             self.assertIsNone(labels.delayed_image_label(state, '2026-10-19T12:00:00Z', 'person'))
         self.assertIsNone(labels.delayed_image_label('2026-10-19T12:01:00Z', '2026-10-19T12:00:00Z', 'sound'))
+        self.assertIsNone(labels.delayed_image_label('2026-10-19T12:01:00Z', '2026-10-19T12:00:00Z', 'package_stranded'))
 
     def test_source_naming_is_limited_to_sdk_last_event_images(self):
         self.assertEqual(labels.detection_entity_for('image.front_door_last_event'), 'event.front_door_detection')

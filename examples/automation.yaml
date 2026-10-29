@@ -1,34 +1,27 @@
-# Legacy manual mode only: set auto_capture: false before using this automation.
-# With backend 1.0.12+, automatic detection capture is enabled by default.
-# Turn off an existing copy of this automation when using automatic capture.
+# Optional manual mode only: set auto_capture: false before enabling this.
+# Automatic capture in 1.0.14+ already watches these entities. Do not run both.
 alias: Front Door - Save snapshots to timeline
-description: Save each new Eufy SDK event image with its detection category.
+description: Save the displayed Last event image for a relevant front-door detection.
 triggers:
   - trigger: state
-    entity_id: image.front_door_last_event
-    id: image_update
+    entity_id: event.front_door_detection
 conditions:
   - condition: template
     value_template: >-
-      {{ trigger.from_state is not none and trigger.to_state is not none and
-         trigger.from_state.state not in ['unknown', 'unavailable', 'none', ''] and
-         trigger.from_state.state != trigger.to_state.state and
-         trigger.to_state.state not in ['unknown', 'unavailable', 'none', ''] }}
-variables:
-  # Freeze the label before the queued capture runs. Old detections must not
-  # categorize a manual refresh or an unrelated thumbnail.
-  event_label: >-
-        {% set detection = states('event.front_door_detection') %}
-        {% set kind = state_attr('event.front_door_detection', 'event_type') %}
-        {% set age = as_timestamp(trigger.to_state.state, 0) - as_timestamp(detection, 0) %}
-        {{ kind if kind in ['person', 'stranger', 'package_delivered',
-                            'package_taken', 'package_stranded', 'motion']
-                   and -5 <= age <= 300 else 'image_update' }}
+      {{ trigger.to_state is not none and
+         trigger.to_state.state not in ['unknown', 'unavailable', 'none', ''] and
+         trigger.to_state.attributes.get('event_type') in
+           ['person', 'stranger', 'package_delivered', 'package_taken'] and
+         (trigger.from_state is none or
+          trigger.from_state.state != trigger.to_state.state or
+          trigger.from_state.attributes.get('event_type') !=
+            trigger.to_state.attributes.get('event_type')) and
+         -5 <= as_timestamp(now()) - as_timestamp(trigger.to_state.state, 0) <= 60 }}
 actions:
   - action: front_door_timeline.capture
     data:
       entity_id: image.front_door_last_event
-      label: "{{ event_label }}"
+      label: "{{ trigger.to_state.attributes.event_type }}"
+      event_timestamp: "{{ trigger.to_state.state }}"
 mode: queued
-max: 10
-
+max: 20

@@ -18,6 +18,26 @@ SNAPSHOT_RE = re.compile(
 )
 
 
+def finalize_event_snapshot(pending: Path, destination: Path) -> str:
+    """Commit one file per detection; a late image updates that same file.
+
+    Separate detections may expose the same bytes. Their timestamps and types
+    identify different events, so do not suppress them by comparing other files.
+    """
+    try:
+        if not pending.is_file() or pending.stat().st_size == 0:
+            raise ValueError(f"Snapshot action completed but no image was written for {destination}")
+        if SNAPSHOT_RE.fullmatch(destination.name) is None:
+            raise ValueError("Invalid timeline snapshot filename")
+        existed = destination.exists()
+        if existed and _digest(pending) == _digest(destination):
+            return "unchanged"
+        pending.replace(destination)
+        return "updated" if existed else "saved"
+    finally:
+        pending.unlink(missing_ok=True)
+
+
 def _digest(path: Path) -> bytes:
     with path.open("rb") as stream:
         return file_digest(stream, "sha256").digest()
